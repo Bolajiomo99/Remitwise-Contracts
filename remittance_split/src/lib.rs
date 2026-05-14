@@ -1,7 +1,6 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-extern crate alloc;
 #[cfg(test)]
 mod events_schema_test;
 #[cfg(test)]
