@@ -6,7 +6,6 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 extern crate alloc;
-use alloc::string::ToString;
 
 // Event topics
 const GOAL_CREATED: Symbol = symbol_short!("created");
