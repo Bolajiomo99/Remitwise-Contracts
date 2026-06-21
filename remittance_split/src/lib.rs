@@ -272,7 +272,7 @@ pub struct RemittanceSchedulePage {
 
 /// Split allocation output item for UI/analytics consumers.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Allocation {
     pub category: Symbol,
     pub amount: i128,

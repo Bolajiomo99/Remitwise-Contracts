@@ -5228,15 +5228,17 @@ fn test_auth_matrix_comprehensive_role_isolation() {
 #[test]
 fn test_precision_spending_overflow_graceful() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, FamilyWallet);
     let client = FamilyWalletClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let member = Address::generate(&env);
-    let mut initial_members = Vec::new(&env);
-    initial_members.push_back(member.clone());
 
-    client.init(&admin, &initial_members);
+    client.init(&admin, &vec![&env]);
+    // Give the member a finite spending limit so a near-i128::MAX amount is over
+    // the limit and must be rejected gracefully (rather than overflowing).
+    client.add_member(&admin, &member, &FamilyRole::Member, &1000_0000000);
 
     // Assert that calling with near i128::MAX returns a graceful error or handles it cleanly
     let result = client.try_validate_precision_spending(&member, &i128::MAX);

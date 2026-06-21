@@ -844,7 +844,20 @@ impl FamilyWallet {
 
         pending_tx.signatures.push_back(signer.clone());
 
-        if pending_tx.signatures.len() >= config.threshold {
+        // Count only signatures whose signer is still authorized in the CURRENT
+        // config. Signatures collected from signers that were rotated out before
+        // this call must not contribute to quorum.
+        let mut valid_signatures: u32 = 0;
+        for sig in pending_tx.signatures.iter() {
+            for authorized_signer in config.signers.iter() {
+                if authorized_signer.clone() == sig {
+                    valid_signatures += 1;
+                    break;
+                }
+            }
+        }
+
+        if valid_signatures >= config.threshold {
             let executed = Self::execute_transaction_internal(
                 &env,
                 &pending_tx.proposer,
