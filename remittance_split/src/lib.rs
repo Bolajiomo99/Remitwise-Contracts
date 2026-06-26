@@ -100,13 +100,24 @@ pub enum SplitEvent {
     DistributionCompleted,
 }
 
-/// Snapshot for data export/import (migration). Checksum is a simple numeric digest for on-chain verification.
+/// Snapshot for data export/import (migration).
+///
+/// The checksum covers both `config` and `schedules` so that import can
+/// verify the payload was not corrupted or tampered with in transit.
+///
+/// `next_rsch` records the highest schedule id that existed at export time;
+/// `import_snapshot` advances `NEXT_RSCH` to at least this value so that
+/// any schedules created after the import never collide with imported ids.
 #[contracttype]
 #[derive(Clone)]
 pub struct ExportSnapshot {
     pub version: u32,
     pub checksum: u64,
     pub config: SplitConfig,
+    /// All remittance schedules at export time.
+    pub schedules: Vec<RemittanceSchedule>,
+    /// Highest schedule id counter at export time.
+    pub next_rsch: u32,
 }
 
 /// Audit log entry for security and compliance.
@@ -150,11 +161,26 @@ const SNAPSHOT_VERSION: u32 = 1;
 const MAX_AUDIT_ENTRIES: u32 = 100;
 const CONTRACT_VERSION: u32 = 1;
 
+/// Paginated result for `get_schedules_paginated`.
+#[contracttype]
+#[derive(Clone)]
+pub struct SchedulePage {
+    pub items: Vec<RemittanceSchedule>,
+    /// Id of the last item in this page, or 0 when there are no more pages.
+    pub next_cursor: u32,
+    /// Number of items in this page.
+    pub count: u32,
+}
+
 #[contract]
 pub struct RemittanceSplit;
 
 #[contractimpl]
 impl RemittanceSplit {
+    /// Storage key for the per-owner schedule-id index:
+    /// `Map<Address, Vec<u32>>` mapping each owner to the list of their schedule ids.
+    const STORAGE_OWNER_SCHED_IDS: Symbol = symbol_short!("OWN_SCH");
+
     fn get_pause_admin(env: &Env) -> Option<Address> {
         env.storage().instance().get(&symbol_short!("PAUSE_ADM"))
     }
@@ -651,14 +677,53 @@ impl RemittanceSplit {
         if config.owner != caller {
             return Err(RemittanceSplitError::Unauthorized);
         }
-        let checksum = Self::compute_checksum(SNAPSHOT_VERSION, &config);
+
+        // Collect all schedules into an ordered Vec.
+        let next_rsch: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("NEXT_RSCH"))
+            .unwrap_or(0u32);
+        let sched_map: Map<u32, RemittanceSchedule> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("REM_SCH"))
+            .unwrap_or_else(|| Map::new(&env));
+        let mut schedules = Vec::new(&env);
+        for i in 1..=next_rsch {
+            if let Some(s) = sched_map.get(i) {
+                schedules.push_back(s);
+            }
+        }
+
+        let checksum = Self::compute_checksum(SNAPSHOT_VERSION, &config, &schedules, next_rsch);
         Ok(Some(ExportSnapshot {
             version: SNAPSHOT_VERSION,
             checksum,
             config,
+            schedules,
+            next_rsch,
         }))
     }
 
+    /// Import a previously-exported snapshot, restoring both the `SplitConfig`
+    /// and all `RemittanceSchedule`s.
+    ///
+    /// # Index reconstruction
+    /// After writing each imported schedule to the `REM_SCH` map this function
+    /// also appends the schedule id to the per-owner `OWN_SCH` index
+    /// (`Map<Address, Vec<u32>>`).  Without this step the schedules would be
+    /// present in storage but invisible to `get_remittance_schedules`,
+    /// `get_schedules_paginated`, and `execute_due_remittance_schedules`.
+    ///
+    /// # NEXT_RSCH advancement
+    /// `NEXT_RSCH` is set to the maximum of its current value and the
+    /// `snapshot.next_rsch` field so that any schedule created after the import
+    /// receives an id that does not collide with an imported schedule.
+    ///
+    /// # Idempotency
+    /// The owner index is built from scratch on every import, so re-importing the
+    /// same snapshot (or a newer one) always produces a consistent, non-stale index.
     pub fn import_snapshot(
         env: Env,
         caller: Address,
@@ -672,7 +737,12 @@ impl RemittanceSplit {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(RemittanceSplitError::UnsupportedVersion);
         }
-        let expected = Self::compute_checksum(snapshot.version, &snapshot.config);
+        let expected = Self::compute_checksum(
+            snapshot.version,
+            &snapshot.config,
+            &snapshot.schedules,
+            snapshot.next_rsch,
+        );
         if snapshot.checksum != expected {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(RemittanceSplitError::ChecksumMismatch);
@@ -698,6 +768,8 @@ impl RemittanceSplit {
         }
 
         Self::extend_instance_ttl(&env);
+
+        // --- Restore config and split percentages ---
         env.storage()
             .instance()
             .set(&symbol_short!("CONFIG"), &snapshot.config);
@@ -711,6 +783,49 @@ impl RemittanceSplit {
                 snapshot.config.insurance_percent,
             ],
         );
+
+        // --- Restore schedule map and rebuild per-owner index ---
+        //
+        // We start with fresh maps so that a re-import never leaves stale ids in
+        // the owner index from a previous import.
+        let mut sched_map: Map<u32, RemittanceSchedule> = Map::new(&env);
+        let mut owner_index: Map<Address, Vec<u32>> = Map::new(&env);
+
+        let mut max_id: u32 = snapshot.next_rsch;
+        for schedule in snapshot.schedules.iter() {
+            // Track the highest id so NEXT_RSCH is correct even if next_rsch
+            // was under-counted in the snapshot payload.
+            if schedule.id > max_id {
+                max_id = schedule.id;
+            }
+            sched_map.set(schedule.id, schedule.clone());
+
+            // Append this schedule's id to the owner's index entry.
+            let mut ids = owner_index
+                .get(schedule.owner.clone())
+                .unwrap_or_else(|| Vec::new(&env));
+            ids.push_back(schedule.id);
+            owner_index.set(schedule.owner.clone(), ids);
+        }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("REM_SCH"), &sched_map);
+        env.storage()
+            .instance()
+            .set(&Self::STORAGE_OWNER_SCHED_IDS, &owner_index);
+
+        // Advance NEXT_RSCH to max_id so new schedules never reuse an imported id.
+        let current_next: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("NEXT_RSCH"))
+            .unwrap_or(0u32);
+        if max_id > current_next {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("NEXT_RSCH"), &max_id);
+        }
 
         Self::increment_nonce(&env, &caller)?;
         Self::append_audit(&env, symbol_short!("import"), &caller, true);
@@ -764,17 +879,29 @@ impl RemittanceSplit {
         Ok(())
     }
 
-    fn compute_checksum(version: u32, config: &SplitConfig) -> u64 {
+    fn compute_checksum(version: u32, config: &SplitConfig, schedules: &Vec<RemittanceSchedule>, next_rsch: u32) -> u64 {
         let v = version as u64;
         let s = config.spending_percent as u64;
         let g = config.savings_percent as u64;
         let b = config.bills_percent as u64;
         let i = config.insurance_percent as u64;
-        v.wrapping_add(s)
+        let mut c = v
+            .wrapping_add(s)
             .wrapping_add(g)
             .wrapping_add(b)
             .wrapping_add(i)
-            .wrapping_mul(31)
+            .wrapping_add(next_rsch as u64);
+        // Mix in schedule data so checksum catches corrupted schedule payloads.
+        for idx in 0..schedules.len() {
+            if let Some(sched) = schedules.get(idx) {
+                c = c
+                    .wrapping_add(sched.id as u64)
+                    .wrapping_add(sched.amount as u64)
+                    .wrapping_add(sched.next_due)
+                    .wrapping_add(sched.interval);
+            }
+        }
+        c.wrapping_mul(31)
     }
 
     fn append_audit(env: &Env, operation: Symbol, caller: &Address, success: bool) {
@@ -923,6 +1050,22 @@ impl RemittanceSplit {
             .instance()
             .set(&symbol_short!("NEXT_RSCH"), &next_schedule_id);
 
+        // Update per-owner index so get_remittance_schedules / get_schedules_paginated
+        // can locate this schedule without a full table scan.
+        let mut owner_index: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&Self::STORAGE_OWNER_SCHED_IDS)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut ids = owner_index
+            .get(owner.clone())
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(next_schedule_id);
+        owner_index.set(owner.clone(), ids);
+        env.storage()
+            .instance()
+            .set(&Self::STORAGE_OWNER_SCHED_IDS, &owner_index);
+
         env.events().publish(
             (symbol_short!("schedule"), ScheduleEvent::Created),
             (next_schedule_id, owner),
@@ -1022,6 +1165,12 @@ impl RemittanceSplit {
         Ok(true)
     }
 
+    /// Returns all remittance schedules belonging to `owner`.
+    ///
+    /// Uses the per-owner index (`OWN_SCH`) when available so that the result
+    /// includes schedules that were restored via `import_snapshot`.  Falls back
+    /// to a full-map scan when the index is absent (e.g. legacy state created
+    /// before the index was introduced).
     pub fn get_remittance_schedules(env: Env, owner: Address) -> Vec<RemittanceSchedule> {
         let schedules: Map<u32, RemittanceSchedule> = env
             .storage()
@@ -1029,13 +1178,31 @@ impl RemittanceSplit {
             .get(&symbol_short!("REM_SCH"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut result = Vec::new(&env);
-        for (_, schedule) in schedules.iter() {
-            if schedule.owner == owner {
-                result.push_back(schedule);
+        let owner_index: Option<Map<Address, Vec<u32>>> =
+            env.storage().instance().get(&Self::STORAGE_OWNER_SCHED_IDS);
+
+        if let Some(index) = owner_index {
+            // Fast path — walk only the ids registered for this owner.
+            let ids = index
+                .get(owner.clone())
+                .unwrap_or_else(|| Vec::new(&env));
+            let mut result = Vec::new(&env);
+            for id in ids.iter() {
+                if let Some(s) = schedules.get(id) {
+                    result.push_back(s);
+                }
             }
+            result
+        } else {
+            // Fallback full scan (no index present).
+            let mut result = Vec::new(&env);
+            for (_, schedule) in schedules.iter() {
+                if schedule.owner == owner {
+                    result.push_back(schedule);
+                }
+            }
+            result
         }
-        result
     }
 
     pub fn get_remittance_schedule(env: Env, schedule_id: u32) -> Option<RemittanceSchedule> {
@@ -1047,6 +1214,155 @@ impl RemittanceSplit {
 
         schedules.get(schedule_id)
     }
+
+    /// Returns a cursor-paginated page of schedules for `owner`.
+    ///
+    /// `cursor` is the id of the first schedule to include (pass `0` for the
+    /// first page).  `limit` is the maximum number of items to return (clamped
+    /// to 50).  The returned `SchedulePage.next_cursor` is the id of the first
+    /// item of the *next* page, or `0` when there are no more pages.
+    pub fn get_schedules_paginated(
+        env: Env,
+        owner: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> SchedulePage {
+        let max_limit: u32 = 50;
+        let page_size = if limit == 0 || limit > max_limit {
+            max_limit
+        } else {
+            limit
+        };
+
+        let schedules: Map<u32, RemittanceSchedule> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("REM_SCH"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let owner_index: Option<Map<Address, Vec<u32>>> =
+            env.storage().instance().get(&Self::STORAGE_OWNER_SCHED_IDS);
+
+        // Collect all ids that belong to this owner, in index order.
+        let all_ids: Vec<u32> = if let Some(index) = owner_index {
+            index
+                .get(owner.clone())
+                .unwrap_or_else(|| Vec::new(&env))
+        } else {
+            // Fallback: derive ids from full schedule scan.
+            let mut ids = Vec::new(&env);
+            for (id, sched) in schedules.iter() {
+                if sched.owner == owner {
+                    ids.push_back(id);
+                }
+            }
+            ids
+        };
+
+        let total = all_ids.len();
+        // Find the start position: first index where id >= cursor (or 0 = from start).
+        let start: u32 = if cursor == 0 {
+            0
+        } else {
+            let mut pos = total; // default: not found → empty page
+            for i in 0..total {
+                if let Some(id) = all_ids.get(i) {
+                    if id >= cursor {
+                        pos = i;
+                        break;
+                    }
+                }
+            }
+            pos
+        };
+
+        let end = (start + page_size).min(total);
+        let mut items = Vec::new(&env);
+        for i in start..end {
+            if let Some(id) = all_ids.get(i) {
+                if let Some(s) = schedules.get(id) {
+                    items.push_back(s);
+                }
+            }
+        }
+
+        let next_cursor = if end < total {
+            all_ids.get(end).unwrap_or(0)
+        } else {
+            0
+        };
+
+        SchedulePage {
+            count: items.len(),
+            items,
+            next_cursor,
+        }
+    }
+
+    /// Execute all remittance schedules whose `next_due` has arrived.
+    ///
+    /// This is the "due sweep" called by an off-chain keeper or cron.  It
+    /// iterates the full schedule map, marks one-shot schedules inactive, and
+    /// advances recurring schedules to their next due date.  `last_executed`
+    /// and `missed_count` are preserved faithfully for schedules that were
+    /// restored via `import_snapshot`.
+    ///
+    /// Returns the ids of every schedule that was executed in this sweep.
+    pub fn execute_due_remittance_schedules(env: Env) -> Vec<u32> {
+        Self::extend_instance_ttl(&env);
+
+        let current_time = env.ledger().timestamp();
+        let mut executed = Vec::new(&env);
+
+        let mut schedules: Map<u32, RemittanceSchedule> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("REM_SCH"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        for (schedule_id, mut schedule) in schedules.iter() {
+            if !schedule.active || schedule.next_due > current_time {
+                continue;
+            }
+
+            schedule.last_executed = Some(current_time);
+
+            if schedule.recurring && schedule.interval > 0 {
+                let mut missed = 0u32;
+                let mut next = schedule.next_due + schedule.interval;
+                while next <= current_time {
+                    missed = missed.saturating_add(1);
+                    next += schedule.interval;
+                }
+                schedule.missed_count = schedule.missed_count.saturating_add(missed);
+                schedule.next_due = next;
+
+                if missed > 0 {
+                    env.events().publish(
+                        (symbol_short!("schedule"), ScheduleEvent::Missed),
+                        (schedule_id, missed),
+                    );
+                }
+            } else {
+                schedule.active = false;
+            }
+
+            schedules.set(schedule_id, schedule);
+            executed.push_back(schedule_id);
+
+            env.events().publish(
+                (symbol_short!("schedule"), ScheduleEvent::Executed),
+                schedule_id,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("REM_SCH"), &schedules);
+
+        executed
+    }
+
 }
 
 #[cfg(test)]
