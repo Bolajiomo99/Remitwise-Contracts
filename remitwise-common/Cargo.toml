@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [features]
-testutils = []
+testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = "=21.7.7"
