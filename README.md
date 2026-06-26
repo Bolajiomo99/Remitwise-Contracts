@@ -302,6 +302,7 @@ To run an example, use `cargo run --example <example_name>`:
 
 ## Documentation
 
+- [Authorization Matrix](docs/AUTHORIZATION_MATRIX.md) - Per-entrypoint caller authorization requirements for all contracts
 - [Family Wallet Design (as implemented)](docs/family-wallet-design.md)
 - [Event Indexing Guide](docs/INDEXING.md) - Mapping contract events to off-chain tables
 - [Financial Health Score Model](docs/HEALTH_SCORE.md) - HealthScore component weights, inputs, clamping, and worked examples
@@ -732,6 +733,8 @@ A comprehensive security review and threat model is available in [THREAT_MODEL.m
 - [SECURITY-003] Add Rate Limiting to Emergency Transfers (HIGH)
 - [SECURITY-004] Replace Checksum with Cryptographic Hash (MEDIUM)
 - [SECURITY-005] Implement Storage Bounds and Entity Limits (MEDIUM)
+
+> **PR Review Checklist:** Before merging security-sensitive PRs, reviewers must complete the [Security Review Checklist](docs/SECURITY_REVIEW.md).
 
 See the [.github/ISSUE_TEMPLATE](.github/ISSUE_TEMPLATE) directory for detailed security issue descriptions.
 
