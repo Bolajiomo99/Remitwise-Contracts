@@ -11,10 +11,12 @@
 //! - Maximum safe goal amount: i128::MAX/2 (to allow for safe addition operations)
 //! - add_to_goal uses checked_add internally and will panic with "overflow" on overflow
 //! - withdraw_from_goal uses checked_sub internally and will panic with "underflow" on underflow
-//! - No explicit caps are imposed by the contract, but overflow/underflow will panic
+//! - add_to_goal enforces `current_amount <= i128::MAX/2` and returns `Overflow` if exceeded
 //! - batch_add_to_goals has same limitations as add_to_goal for each contribution
 
-use savings_goals::{ContributionItem, SavingsGoalContract, SavingsGoalContractClient};
+use savings_goals::{
+    ContributionItem, SavingsGoalContract, SavingsGoalContractClient, SavingsGoalError,
+};
 use soroban_sdk::testutils::{Address as AddressTrait, Ledger, LedgerInfo};
 use soroban_sdk::{Env, String, Vec};
 
@@ -48,6 +50,7 @@ fn test_create_goal_near_max_i128() {
         &String::from_str(&env, "Large Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
     let goal = client.get_goal(&goal_id).unwrap();
@@ -71,6 +74,7 @@ fn test_add_to_goal_with_large_amount() {
         &String::from_str(&env, "Large Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
     env.mock_all_auths();
@@ -98,6 +102,7 @@ fn test_add_to_goal_multiple_large_contributions() {
         &String::from_str(&env, "Large Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
     // Add multiple times safely
@@ -114,8 +119,7 @@ fn test_add_to_goal_multiple_large_contributions() {
     assert_eq!(total3, contribution + contribution + contribution);
 }
 #[test]
-#[should_panic(expected = "overflow")]
-fn test_add_to_goal_overflow_panics() {
+fn test_add_to_goal_overflow_returns_error() {
     let env = Env::default();
     let contract_id = env.register_contract(None, SavingsGoalContract);
     let client = SavingsGoalContractClient::new(&env, &contract_id);
@@ -124,22 +128,169 @@ fn test_add_to_goal_overflow_panics() {
     env.mock_all_auths();
 
     let large_target = i128::MAX;
-    let overflow_amount = i128::MAX / 2 + 1000;
+    let safe_cap = i128::MAX / 2;
 
     let goal_id = client.create_goal(
         &owner,
         &String::from_str(&env, "Overflow Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
-    // First addition
+    // First addition should succeed at the safe cap boundary.
     env.mock_all_auths();
-    client.add_to_goal(&owner, &goal_id, &overflow_amount);
+    let first = client.add_to_goal(&owner, &goal_id, &safe_cap);
+    assert_eq!(first, safe_cap);
 
-    // Second addition should overflow
+    // Second addition should return an overflow error rather than panic
     env.mock_all_auths();
-    client.add_to_goal(&owner, &goal_id, &overflow_amount);
+    let result = client.try_add_to_goal(&owner, &goal_id, &1);
+    assert_eq!(result, Err(Ok(SavingsGoalError::Overflow)));
+}
+
+#[test]
+fn test_batch_add_to_goals_overflow_returns_error() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let large_target = i128::MAX;
+    let contribution = i128::MAX / 2 + 1;
+
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Batch Overflow Goal"),
+        &large_target,
+        &2000000,
+        &false,
+    );
+
+    env.mock_all_auths();
+    let mut contributions = Vec::new(&env);
+    contributions.push_back(ContributionItem {
+        goal_id,
+        amount: contribution,
+    });
+    contributions.push_back(ContributionItem {
+        goal_id,
+        amount: contribution,
+    });
+
+    env.mock_all_auths();
+    let result = client.try_batch_add_to_goals(&owner, &contributions);
+    assert_eq!(result, Err(Ok(SavingsGoalError::Overflow)));
+}
+
+#[test]
+fn test_batch_add_to_goals_duplicate_goal_ids_use_updated_balance() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let safe_cap = i128::MAX / 2;
+    let starting_balance = safe_cap - 2;
+
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Duplicate Batch Goal"),
+        &i128::MAX,
+        &2000000,
+        &false,
+    );
+
+    env.mock_all_auths();
+    let current = client.add_to_goal(&owner, &goal_id, &starting_balance);
+    assert_eq!(current, starting_balance);
+
+    let mut contributions = Vec::new(&env);
+    contributions.push_back(ContributionItem { goal_id, amount: 1 });
+    contributions.push_back(ContributionItem { goal_id, amount: 1 });
+
+    env.mock_all_auths();
+    let processed = client.batch_add_to_goals(&owner, &contributions);
+    assert_eq!(processed, 2);
+
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, safe_cap);
+    assert_eq!(goal.target_amount, i128::MAX);
+}
+
+#[test]
+fn test_batch_add_to_goals_rejects_zero_and_negative_amounts() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Invalid Amount Goal"),
+        &1000,
+        &2000000,
+        &false,
+    );
+
+    let mut zero_batch = Vec::new(&env);
+    zero_batch.push_back(ContributionItem { goal_id, amount: 0 });
+
+    env.mock_all_auths();
+    let zero_result = client.try_batch_add_to_goals(&owner, &zero_batch);
+    assert_eq!(zero_result, Err(Ok(SavingsGoalError::InvalidAmount)));
+
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, 0);
+
+    let mut negative_batch = Vec::new(&env);
+    negative_batch.push_back(ContributionItem {
+        goal_id,
+        amount: -1,
+    });
+
+    env.mock_all_auths();
+    let negative_result = client.try_batch_add_to_goals(&owner, &negative_batch);
+    assert_eq!(negative_result, Err(Ok(SavingsGoalError::InvalidAmount)));
+
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, 0);
+}
+
+#[test]
+fn test_batch_add_to_goals_rejects_oversized_batch() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Oversized Batch Goal"),
+        &1000,
+        &2000000,
+        &false,
+    );
+
+    let mut contributions = Vec::new(&env);
+    for _ in 0..51 {
+        contributions.push_back(ContributionItem { goal_id, amount: 1 });
+    }
+
+    env.mock_all_auths();
+    let result = client.try_batch_add_to_goals(&owner, &contributions);
+    assert_eq!(result, Err(Ok(SavingsGoalError::BatchTooLarge)));
+
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, 0);
 }
 #[test]
 fn test_withdraw_from_goal_with_large_amount() {
@@ -158,6 +309,7 @@ fn test_withdraw_from_goal_with_large_amount() {
         &String::from_str(&env, "Large Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
     // Add funds
@@ -227,6 +379,7 @@ fn test_goal_completion_with_large_amounts() {
         &String::from_str(&env, "Large Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
     // Add exactly the target amount
@@ -259,6 +412,7 @@ fn test_batch_add_with_large_amounts() {
         &String::from_str(&env, "Goal 1"),
         &large_target,
         &2000000,
+        &false,
     );
 
     env.mock_all_auths();
@@ -267,6 +421,7 @@ fn test_batch_add_with_large_amounts() {
         &String::from_str(&env, "Goal 2"),
         &large_target,
         &2000000,
+        &false,
     );
 
     env.mock_all_auths();
@@ -275,6 +430,7 @@ fn test_batch_add_with_large_amounts() {
         &String::from_str(&env, "Goal 3"),
         &large_target,
         &2000000,
+        &false,
     );
 
     // Batch add to all goals
@@ -324,6 +480,7 @@ fn test_multiple_goals_with_large_amounts() {
             &String::from_str(&env, &format!("Goal {}", i)),
             &large_target,
             &2000000,
+            &false,
         );
         env.mock_all_auths();
     }
@@ -354,6 +511,7 @@ fn test_edge_case_i128_max_minus_one() {
         &String::from_str(&env, "Edge Case"),
         &edge_target,
         &2000000,
+        &false,
     );
 
     let goal = client.get_goal(&goal_id).unwrap();
@@ -377,6 +535,7 @@ fn test_pagination_with_large_amounts() {
             &String::from_str(&env, &format!("Goal {}", i)),
             &large_target,
             &2000000,
+            &false,
         );
         env.mock_all_auths();
     }
@@ -410,22 +569,35 @@ fn test_lock_unlock_with_large_amounts() {
     let large_target = i128::MAX / 4;
     let large_amount = i128::MAX / 8;
 
+    // Default unlocked path (new behaviour)
     let goal_id = client.create_goal(
         &owner,
         &String::from_str(&env, "Large Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
-    // Add funds
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert!(!goal.locked); // Updated: default is now unlocked
+
+    // Explicit locked path (commitment device)
+    let locked_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Locked Commitment"),
+        &large_target,
+        &2000000,
+        &true,
+    );
+
+    let locked_goal = client.get_goal(&locked_id).unwrap();
+    assert!(locked_goal.locked);
+
+    // Add funds (succeeds on unlocked goal)
     env.mock_all_auths();
     client.add_to_goal(&owner, &goal_id, &large_amount);
 
-    // Goal starts locked
-    let goal = client.get_goal(&goal_id).unwrap();
-    assert!(goal.locked);
-
-    // Unlock
+    // Unlock (idempotent on already-unlocked)
     env.mock_all_auths();
     client.unlock_goal(&owner, &goal_id);
 
@@ -463,6 +635,7 @@ fn test_sequential_large_operations() {
             &String::from_str(&env, &format!("Goal {}", i)),
             amount,
             &2000000,
+            &false,
         );
 
         env.mock_all_auths();
@@ -494,6 +667,7 @@ fn test_time_lock_with_large_amounts() {
         &String::from_str(&env, "Time-locked Goal"),
         &large_target,
         &2000000,
+        &false,
     );
 
     // Add funds
@@ -539,6 +713,7 @@ fn test_export_import_snapshot_with_large_amounts() {
         &String::from_str(&env, "Goal 1"),
         &large_target,
         &2000000,
+        &false,
     );
 
     env.mock_all_auths();
@@ -550,6 +725,7 @@ fn test_export_import_snapshot_with_large_amounts() {
         &String::from_str(&env, "Goal 2"),
         &large_target,
         &2000000,
+        &false,
     );
 
     env.mock_all_auths();
@@ -567,4 +743,268 @@ fn test_export_import_snapshot_with_large_amounts() {
     env.mock_all_auths();
     let success = client.import_snapshot(&owner, &0, &snapshot);
     assert!(success);
+}
+
+#[test]
+fn test_add_to_goal_near_safe_cap_boundary() {
+    // Test adding amounts right at the boundary of safe operations.
+    // The contract documents max safe goal amount as i128::MAX/2 to allow
+    // for safe addition operations without overflow.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let safe_cap = i128::MAX / 2;
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Near-Cap Goal"),
+        &safe_cap,
+        &2000000,
+        &false,
+    );
+
+    // Add amount that brings us to exactly safe_cap
+    env.mock_all_auths();
+    let first = client.add_to_goal(&owner, &goal_id, &safe_cap);
+    assert_eq!(first, safe_cap);
+
+    // Verify goal is now at capacity
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, safe_cap);
+    assert!(goal.current_amount >= safe_cap); // At or past target
+}
+
+#[test]
+fn test_add_to_goal_just_over_safe_cap_returns_overflow() {
+    // Test that adding beyond i128::MAX/2 reliably returns Overflow
+    // rather than panicking or wrapping around.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let safe_cap = i128::MAX / 2;
+    let beyond_cap = safe_cap + 1;
+
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Over-Cap Goal"),
+        &i128::MAX,
+        &2000000,
+        &false,
+    );
+
+    // First add at safe boundary
+    env.mock_all_auths();
+    let first = client.add_to_goal(&owner, &goal_id, &safe_cap);
+    assert_eq!(first, safe_cap);
+
+    // Try to add just over boundary — must fail gracefully with Overflow
+    env.mock_all_auths();
+    let result = client.try_add_to_goal(&owner, &goal_id, &beyond_cap);
+    assert_eq!(result, Err(Ok(SavingsGoalError::Overflow)));
+}
+
+#[test]
+fn test_withdraw_from_goal_near_underflow() {
+    // Test that withdrawal near zero boundaries is handled correctly
+    // and doesn't cause negative wrapping.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let small_amount = 1000i128;
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Small Goal"),
+        &small_amount,
+        &2000000,
+        &false,
+    );
+
+    // Add small amount
+    env.mock_all_auths();
+    client.add_to_goal(&owner, &goal_id, &small_amount);
+
+    // Unlock for withdrawal
+    env.mock_all_auths();
+    client.unlock_goal(&owner, &goal_id);
+
+    // Withdraw exactly what we added
+    env.mock_all_auths();
+    let remaining = client.withdraw_from_goal(&owner, &goal_id, &small_amount);
+    assert_eq!(remaining, 0);
+
+    // Verify goal is now empty
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, 0);
+}
+
+#[test]
+fn test_withdraw_from_goal_overflow_protection() {
+    // Test that attempting to withdraw more than available returns error
+    // instead of panicking or allowing negative amounts.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let amount = i128::MAX / 10;
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Withdrawal Test"),
+        &(i128::MAX / 2),
+        &2000000,
+        &false,
+    );
+
+    // Add funds
+    env.mock_all_auths();
+    client.add_to_goal(&owner, &goal_id, &amount);
+
+    // Unlock
+    env.mock_all_auths();
+    client.unlock_goal(&owner, &goal_id);
+
+    // Try to withdraw more than available — must fail gracefully
+    env.mock_all_auths();
+    let withdrawing = amount + 1;
+    let result = client.try_withdraw_from_goal(&owner, &goal_id, &withdrawing);
+    assert_eq!(result, Err(Ok(SavingsGoalError::InsufficientBalance)));
+
+    // Verify amount was not modified
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, amount);
+}
+
+#[test]
+fn test_concurrent_near_boundary_operations_deterministic() {
+    // Test that multiple operations near safe boundaries produce
+    // deterministic results and consistent error codes.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let safe_cap = i128::MAX / 2;
+    let first_add = safe_cap / 2;
+    let second_add = safe_cap - first_add;
+
+    // Create three goals at boundary
+    let goal1 = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Goal 1"),
+        &safe_cap,
+        &2000000,
+        &false,
+    );
+
+    env.mock_all_auths();
+    let goal2 = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Goal 2"),
+        &safe_cap,
+        &2000000,
+        &false,
+    );
+
+    env.mock_all_auths();
+    let goal3 = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Goal 3"),
+        &safe_cap,
+        &2000000,
+        &false,
+    );
+
+    // Add amounts that deterministically reach exactly `safe_cap`.
+    env.mock_all_auths();
+    client.add_to_goal(&owner, &goal1, &first_add);
+
+    env.mock_all_auths();
+    client.add_to_goal(&owner, &goal2, &first_add);
+
+    env.mock_all_auths();
+    client.add_to_goal(&owner, &goal3, &first_add);
+
+    // Now add the remainder — should all succeed and land exactly at the cap.
+    env.mock_all_auths();
+    let g1_total = client.add_to_goal(&owner, &goal1, &second_add);
+    assert_eq!(g1_total, safe_cap);
+
+    env.mock_all_auths();
+    let g2_total = client.add_to_goal(&owner, &goal2, &second_add);
+    assert_eq!(g2_total, safe_cap);
+
+    env.mock_all_auths();
+    let g3_total = client.add_to_goal(&owner, &goal3, &second_add);
+    assert_eq!(g3_total, safe_cap);
+
+    // Try one more addition to each — all should fail with same error code
+    env.mock_all_auths();
+    let r1 = client.try_add_to_goal(&owner, &goal1, &1);
+    assert_eq!(r1, Err(Ok(SavingsGoalError::Overflow)));
+
+    env.mock_all_auths();
+    let r2 = client.try_add_to_goal(&owner, &goal2, &1);
+    assert_eq!(r2, Err(Ok(SavingsGoalError::Overflow)));
+
+    env.mock_all_auths();
+    let r3 = client.try_add_to_goal(&owner, &goal3, &1);
+    assert_eq!(r3, Err(Ok(SavingsGoalError::Overflow)));
+}
+
+#[test]
+fn test_error_codes_stable_across_repeated_operations() {
+    // Test that repeated operations near boundaries consistently
+    // return the same error code, proving deterministic error handling.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+    env.mock_all_auths();
+
+    let goal_id = client.create_goal(
+        &owner,
+        &String::from_str(&env, "Error Test"),
+        &1000i128,
+        &2000000,
+        &false,
+    );
+
+    // Fill goal
+    env.mock_all_auths();
+    client.add_to_goal(&owner, &goal_id, &1000);
+
+    // Unlock
+    env.mock_all_auths();
+    client.unlock_goal(&owner, &goal_id);
+
+    // Try insufficient withdrawal multiple times — all should fail identically
+    for _ in 0..3 {
+        env.mock_all_auths();
+        let result = client.try_withdraw_from_goal(&owner, &goal_id, &2000);
+        assert_eq!(
+            result,
+            Err(Ok(SavingsGoalError::InsufficientBalance)),
+            "Error code must be stable across repeated operations"
+        );
+    }
+
+    // Verify goal amount unchanged
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.current_amount, 1000);
 }

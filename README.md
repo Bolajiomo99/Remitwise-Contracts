@@ -8,7 +8,7 @@ This workspace contains the core smart contracts that power RemitWise's post-rem
 
 - **remittance_split**: Automatically splits remittances into spending, savings, bills, and insurance
 - **savings_goals**: Goal-based savings with target dates and locked funds
-- **bill_payments**: Automated bill payment tracking and scheduling
+- **bill_payments**: Automated bill payment tracking and scheduling with recurring bill schedule lifecycle
 - **insurance**: Micro-insurance policy management and premium payments
 - **family_wallet**: Family governance, multisig approvals, and emergency transfer controls
 - **remitwise-common**: Shared types and utilities used across contracts
@@ -33,7 +33,30 @@ A common crate containing shared types, enums, and constants used across multipl
 
 **Shared Utilities:**
 - `clamp_limit()`: Helper for pagination limit validation
+- `validate_period()`: Helper for checking logical ordering of start/end ranges
 - `RemitwiseEvents`: Standardized event emission with `emit()` and `emit_batch()` methods
+
+## Shared Enums & Constants Stability Coverage
+
+This project now includes dedicated compatibility guards in `remitwise-common` to prevent breaking changes across dependent contracts.
+
+- invariant tests for enum discriminants and event tags
+- ordering assumptions verified for role and coverage definitions
+- round-trip serialization via `soroban_sdk::IntoVal`/`TryFromVal`
+- event topic and payload serialization checks for `RemitwiseEvents`
+- pagination and TTL constant stability assertions
+
+### Running the new coverage
+
+```bash
+cargo test -p remitwise-common
+```
+
+### Security notes
+
+- Enums are `#[repr(u32)]` and are asserted in tests, reducing risk of contract integration drift
+- Shared constants used for pagination, batch size, storage TTL, and signature timeout are locked with stability checks
+- `clamp_limit()` now has explicit tests for overflow, underflow, and boundary conditions
 
 ## CLI Tool
 
@@ -245,6 +268,7 @@ If you encounter issues with a specific Soroban version:
 ### Additional Resources
 
 - **[UPGRADE_GUIDE.md](UPGRADE_GUIDE.md)** - Comprehensive upgrade procedures and version-specific migration guides
+- **[docs/UPGRADE_RUNBOOK.md](docs/UPGRADE_RUNBOOK.md)** - Step-by-step contract upgrade runbook and rollback plan for operators
 - **[VERSION_COMPATIBILITY.md](VERSION_COMPATIBILITY.md)** - Detailed compatibility matrix and testing status
 - **[COMPATIBILITY_QUICK_REFERENCE.md](COMPATIBILITY_QUICK_REFERENCE.md)** - Quick reference for common compatibility tasks
 - **[.github/SOROBAN_VERSION_CHECKLIST.md](.github/SOROBAN_VERSION_CHECKLIST.md)** - Validation checklist for new versions
@@ -280,10 +304,15 @@ To run an example, use `cargo run --example <example_name>`:
 
 ## Documentation
 
+- [Authorization Matrix](docs/AUTHORIZATION_MATRIX.md) - Per-entrypoint caller authorization requirements for all contracts
 - [Family Wallet Design (as implemented)](docs/family-wallet-design.md)
+- [Reporting Admin Rotation](docs/reporting-admin-rotation.md) - Two-step upgrade-admin handoff procedure for reporting dependency configuration
+- [Event Indexing Guide](docs/INDEXING.md) - Mapping contract events to off-chain tables
+- [Financial Health Score Model](docs/HEALTH_SCORE.md) - HealthScore component weights, inputs, clamping, and worked examples
 - [Frontend Integration Notes](docs/frontend-integration.md)
 - [Storage Layout Reference](STORAGE_LAYOUT.md)
 - [Event Indexer](indexer/README.md) - Off-chain event indexing and querying
+- [Audit Trail](docs/AUDIT_TRAIL.md) - How to reconstruct historical state from events alone
 - [Tagging Feature](TAGGING_FEATURE.md) - Tag-based organization system
 - [Threat Model](THREAT_MODEL.md) - Security analysis and mitigations
 - [Security Review Summary](SECURITY_REVIEW_SUMMARY.md)
@@ -349,6 +378,12 @@ Tracks and manages bill payments with recurring support.
 - `restore_bill`: Restore archived bill to active storage
 - `bulk_cleanup_bills`: Permanently delete old archives
 - `get_storage_stats`: Get storage usage statistics
+- `create_bill_schedule`: Create a recurring/one-off bill schedule
+- `modify_bill_schedule`: Modify an existing bill schedule
+- `cancel_bill_schedule`: Cancel an active bill schedule
+- `execute_due_bill_schedules`: Execute all due bill schedules (permissionless)
+- `get_bill_schedules`: Get all schedules for an owner
+- `get_bill_schedule`: Get a specific schedule by ID
 
 **Events:**
 
@@ -358,6 +393,16 @@ Tracks and manages bill payments with recurring support.
   - `bill_id`, `name`, `amount`, `timestamp`
 - `RecurringBillCreatedEvent`: Emitted when a recurring bill generates the next bill
   - `bill_id`, `parent_bill_id`, `name`, `amount`, `due_date`, `timestamp`
+- `ScheduleCreatedEvent`: Emitted when a bill schedule is created
+  - `schedule_id`, `owner`
+- `ScheduleExecutedEvent`: Emitted when a bill schedule is executed
+  - `schedule_id`
+- `ScheduleModifiedEvent`: Emitted when a bill schedule is modified
+  - `schedule_id`
+- `ScheduleCancelledEvent`: Emitted when a bill schedule is cancelled
+  - `schedule_id`
+- `ScheduleMissedEvent`: Emitted when a recurring schedule skips intervals
+  - `schedule_id`, `missed`
 
 ### Insurance
 
@@ -386,6 +431,15 @@ Bill and insurance events include `external_ref` where applicable for off-chain 
   - `policy_id`, `name`, `timestamp`
 
 Bill and insurance events include `external_ref` where applicable for off-chain linking.
+
+### Reporting
+
+Provides summarized views of user financial data across all ecosystem contracts.
+
+**Key Features:**
+
+- `get_remittance_summary`: Aggregates split, savings, bills, and insurance data into a single summary
+- **Graceful Degradation**: Implements a `DataAvailability` indicator (`Complete`, `Partial`, `Missing`) ensuring summary queries return available data without a hard panic if upstream contracts are unresponsive, unconfigured, or fail.
 
 ### Family Wallet
 
@@ -434,6 +488,45 @@ Run tests for all contracts:
 cargo test
 ```
 
+### Feature Flag Consistency
+
+The CI pipeline includes a feature flag consistency check (`scripts/check_features.py`) that verifies every `cfg(feature = "...")` reference in Rust source code has a corresponding entry in the crate's `[features]` section. This catches stale or misspelled feature gates before they reach production.
+
+Run it locally:
+
+```bash
+python3 scripts/check_features.py
+```
+
+### Encrypted migration payload decode safety
+
+The `data_migration` crate supports an **opaque encrypted payload** transport format for off-chain migration tooling.
+
+**Format contract**
+
+- `enc:v1:<base64>`
+
+Where:
+
+- `enc:v1:` is a strict marker prefix.
+- `<base64>` is the base64-encoded ciphertext blob.
+
+**Security assumptions and notes**
+
+- `data_migration` does **not** perform cryptographic encryption/decryption; it only transports bytes.
+- The marker prefix prevents accidental decoding of non-encrypted migration strings as ciphertext.
+- Import is strict and must **fail closed** (return an error) for:
+  - missing/incorrect marker
+  - unsupported marker version
+  - empty ciphertext
+  - invalid/truncated base64
+
+Run tests for this crate:
+
+```bash
+cargo test -p data_migration
+```
+
 Run tests for a specific contract:
 
 ```bash
@@ -478,6 +571,28 @@ See [scripts/README_INVARIANT_TESTS.md](scripts/README_INVARIANT_TESTS.md) for d
 - The suite covers minting the payer account, splitting across spending/savings/bills/insurance, and asserting balances along with the new allocation metadata helper.
 - The same command is intended for CI so it runs without manual setup; re-run locally whenever split logic changes or new USDC paths are added.
 
+### Orchestrator audit log pagination correctness
+
+The orchestrator audit API (`get_audit_log(from_index, limit)`) supports cursor-based pagination for compliance and monitoring clients.
+
+**Pagination guarantees:**
+- Results are ordered from oldest to newest in the current bounded audit window.
+- `from_index` is a stable zero-based cursor within that bounded window.
+- `limit` is clamped to contract maximum capacity (`MAX_AUDIT_ENTRIES`) for predictable gas and memory usage.
+- Page-end calculation uses saturating arithmetic to prevent cursor overflow edge cases.
+- Out-of-range cursors return an empty page (safe default).
+
+**Security assumptions and notes:**
+- Consumers should treat the cursor as a position in the current rotated window, not an immutable global ID.
+- Log rotation drops oldest records at capacity, so clients should read promptly and persist externally if long-term retention is required.
+- Tests assert no duplicate entries across sequential pages under heavy execution history and rotation pressure.
+
+Run orchestrator tests (including pagination correctness coverage):
+
+```bash
+cargo test -p orchestrator
+```
+
 ## Gas Benchmarks
 
 RemitWise includes a comprehensive gas benchmarking harness for tracking and optimizing contract performance.
@@ -513,6 +628,7 @@ After verifying optimizations:
 ### Documentation
 
 - **[Benchmarking Guide](benchmarks/README.md)**: Complete benchmarking documentation
+- **[Gas Tuning Guide](docs/GAS_TUNING.md)**: How to interpret gas snapshots and optimize costs
 - **[Gas Optimization Guide](docs/gas-optimization.md)**: Optimization strategies and best practices
 - **[Baseline Results](benchmarks/baseline.json)**: Current performance baseline
 - **[Threshold Configuration](benchmarks/thresholds.json)**: Regression detection thresholds
@@ -606,6 +722,17 @@ soroban contract deploy \
   --network testnet
 ```
 
+## Data Migration
+
+The `data_migration` payload library provides format-agnostic snapshot export/import capabilities across all contracts.
+
+### Import Replay Protection
+
+When importing payloads, the contracts use a `MigrationTracker` to prevent duplicate imports and replay attacks.
+- Payload Identity is cryptographically bound to a `(checksum, version)` tuple.
+- The state tracker persists this tuple alongside the ingestion `timestamp_ms` to outright reject replayed or copied payloads using `MigrationError::DuplicateImport`.
+- Restores are safely guarded against double spending or overriding the active state multiple times.
+
 ## Operational Limits
 
 ID and record-count operating limits (including `u32` overflow analysis and monitoring alerts) are documented in the **Operational Limits and Monitoring** section of [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -636,6 +763,8 @@ A comprehensive security review and threat model is available in [THREAT_MODEL.m
 - [SECURITY-003] Add Rate Limiting to Emergency Transfers (HIGH)
 - [SECURITY-004] Replace Checksum with Cryptographic Hash (MEDIUM)
 - [SECURITY-005] Implement Storage Bounds and Entity Limits (MEDIUM)
+
+> **PR Review Checklist:** Before merging security-sensitive PRs, reviewers must complete the [Security Review Checklist](docs/SECURITY_REVIEW.md).
 
 See the [.github/ISSUE_TEMPLATE](.github/ISSUE_TEMPLATE) directory for detailed security issue descriptions.
 

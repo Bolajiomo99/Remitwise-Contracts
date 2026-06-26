@@ -1,10 +1,11 @@
 # Soroban Version Upgrade Guide
 
-This guide provides detailed instructions for upgrading RemitWise contracts to new Soroban SDK and protocol versions.
+This guide provides detailed instructions for upgrading RemitWise contracts to new Soroban SDK and protocol versions, with special emphasis on admin role transfer security and regression testing.
 
 ## Table of Contents
 
 - [Pre-Upgrade Checklist](#pre-upgrade-checklist)
+- [Admin Role Transfer Security](#admin-role-transfer-security)
 - [Upgrade Process](#upgrade-process)
 - [Version-Specific Migration Guides](#version-specific-migration-guides)
 - [Testing Strategy](#testing-strategy)
@@ -23,6 +24,87 @@ Before upgrading to a new Soroban version:
 - [ ] Review breaking changes and deprecations
 - [ ] Plan testnet validation window
 - [ ] Notify stakeholders of upgrade timeline
+- [ ] **Verify admin role transfer security across all contracts**
+- [ ] **Run comprehensive admin role regression tests**
+
+## Admin Role Transfer Security
+
+### Overview
+
+All RemitWise contracts implement a dual-admin system with strict security controls:
+
+- **PAUSE_ADM**: Controls pause/unpause operations and emergency functions
+- **UPG_ADM**: Controls version upgrades and contract migrations
+
+### Security Requirements
+
+#### Bootstrap Pattern (Bill Payments, Insurance, Savings Goals)
+```rust
+// Initial admin setup - caller must equal new_admin
+if current_admin.is_none() {
+    if caller != new_admin {
+        return Err(Error::Unauthorized);
+    }
+}
+```
+
+#### Owner-Based Pattern (Remittance Split, Family Wallet)
+```rust
+// Initial admin setup - only contract owner can set
+if current_admin.is_none() {
+    if caller != owner {
+        return Err(Error::Unauthorized);
+    }
+}
+```
+
+#### Transfer Pattern (All Contracts)
+```rust
+// Admin transfer - only current admin can transfer
+if let Some(current) = current_admin {
+    if caller != current {
+        return Err(Error::Unauthorized);
+    }
+}
+```
+
+### Critical Security Assumptions
+
+1. **No Unauthorized Bootstrap**: Contracts must prevent unauthorized parties from setting initial admin
+2. **Transfer Isolation**: Only current admin can transfer to new admin
+3. **Cross-Contract Isolation**: Admin of one contract cannot control another
+4. **Pause Resistance**: Admin functions must work even when contract is paused
+5. **Event Auditing**: All admin transfers must emit events for audit trail
+
+### Admin Role Regression Tests
+
+Run comprehensive regression tests before any upgrade:
+
+```bash
+# Run multi-contract admin role tests
+cargo test -p integration_tests test_bootstrap_admin_setup_all_contracts
+cargo test -p integration_tests test_unauthorized_bootstrap_attempts
+cargo test -p integration_tests test_authorized_admin_transfer
+cargo test -p integration_tests test_unauthorized_admin_transfer
+cargo test -p integration_tests test_admin_operations_while_paused
+cargo test -p integration_tests test_version_upgrade_authorization
+cargo test -p integration_tests test_cross_contract_admin_isolation
+cargo test -p integration_tests test_admin_transfer_edge_cases
+cargo test -p integration_tests test_admin_transfer_events
+```
+
+### Locked-State Behavior Testing
+
+Verify admin operations work correctly when contracts are paused:
+
+```bash
+# Test admin functions during pause state
+cargo test -p integration_tests test_admin_operations_while_paused
+
+# Test emergency scenarios
+cargo test -p bill_payments test_emergency_pause_all
+cargo test -p insurance test_emergency_pause_all
+```
 
 ## Upgrade Process
 
@@ -104,6 +186,9 @@ cargo test -p insurance
 cargo test -p family_wallet
 cargo test -p reporting
 cargo test -p orchestrator
+
+# CRITICAL: Run admin role regression tests
+cargo test -p integration_tests multi_contract_integration
 ```
 
 ### Step 6: Gas Benchmark Comparison
@@ -325,6 +410,76 @@ cat gas_comparison_report.txt
 - [ ] Gas costs are within acceptable range
 - [ ] TTL management works correctly
 
+## Pre-Upgrade Snapshot Hook
+
+All RemitWise contracts implement a `pre_upgrade` function that captures critical contract state
+(admin addresses, version, ID counters, configuration) into persistent storage **before** a contract
+upgrade. This enables deterministic rollback if the `post_upgrade` handler detects an inconsistency.
+
+### Architecture
+
+1. **Capture** — Before deploying the new WASM, call `pre_upgrade()` on the current contract.
+   It writes a `PreUpgradeSnapshot` struct under `symbol_short!("SNAPSHOT")` in persistent storage.
+   The snapshot is versioned (`SNAPSHOT_VERSION` in `remitwise-common`) so future migrations can
+   handle legacy formats.
+
+2. **Deploy** — Perform the contract upgrade (`set_upgrade_authority` + `set_version` + deploy new WASM).
+
+3. **Post-Upgrade Validation** — The new `post_upgrade` handler (in the new contract) can call
+   `restore_from_snapshot()` to revert instance state to the captured snapshot, effectively
+   cancelling any inadvertent state changes caused by the upgrade process.
+
+4. **Discard** — After a successful upgrade, call `discard_snapshot()` to remove the snapshot
+   from storage.
+
+### Authorization
+
+- Contracts with an **UPG_ADM** (upgrade admin) require UPG_ADM authorization.
+- Contracts without UPG_ADM use **contract owner** authorization as fallback.
+
+### Events
+
+Each contract emits scoped events under their existing event prefix:
+- `snap_pre` — snapshot taken
+- `snap_rst` — snapshot restored  
+- `snap_dsc` — snapshot discarded
+
+### Snapshot Contents Per Contract
+
+| Contract           | Captured State                                                  |
+|--------------------|----------------------------------------------------------------|
+| Remittance Split   | owner, version, upgrade_admin, pause_admin, fee_pct, paused    |
+| Savings Goals      | owner, version, upgrade_admin, pause_admin, goal_counter       |
+| Bill Payments      | owner, version, upgrade_admin, pause_admin, bill_counter       |
+| Insurance          | owner, version, policy_count, active_policies, initialized     |
+| Family Wallet      | owner, version, pause_admin, upgrade_admin, emergency_config, next_tx, prop_exp |
+| Orchestrator       | owner, version, all 5 dependency addresses, execution_state, stats, param_ids |
+
+### Testing
+
+Run the per-contract pre_upgrade roundtrip tests:
+
+```bash
+cargo test -p remittance_split test_pre_upgrade
+cargo test -p savings_goals test_pre_upgrade
+cargo test -p bill_payments test_pre_upgrade
+cargo test -p insurance test_pre_upgrade
+cargo test -p family_wallet test_pre_upgrade
+cargo test -p orchestrator test_pre_upgrade
+```
+
+### Rollback Procedure Using Snapshots
+
+If a `post_upgrade` handler fails or returns an unexpected state:
+
+1. Identify the failing contract and its deployed instance.
+2. Invoke `restore_from_snapshot` on the upgraded contract (authorized by UPG_ADM or owner).
+3. Verify that critical state (owner, version, counters) matches the pre-upgrade values.
+4. If the snapshot is no longer needed, call `discard_snapshot`.
+
+> **Safety**: Snapshots survive contract upgrades because they are stored in persistent storage
+> (not instance storage). The snapshot is only removed by an explicit `discard_snapshot` call.
+
 ## Rollback Procedures
 
 If issues are discovered after upgrade:
@@ -441,6 +596,7 @@ Upgrade is considered successful when:
 - [Stellar Protocol Upgrades](https://stellar.org/developers/docs/fundamentals-and-concepts/stellar-consensus-protocol#protocol-upgrades)
 - [Soroban Discord](https://discord.gg/stellar)
 - [Stellar Stack Exchange](https://stellar.stackexchange.com/)
+- [docs/UPGRADE_RUNBOOK.md](docs/UPGRADE_RUNBOOK.md) - Step-by-step contract upgrade runbook and rollback plan
 
 ## Support
 

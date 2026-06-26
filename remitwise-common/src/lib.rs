@@ -1,6 +1,7 @@
 #![no_std]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use soroban_sdk::{contracttype, symbol_short, Symbol};
+use soroban_sdk::{contracterror, contracttype, symbol_short, Symbol};
 
 /// Financial categories for remittance allocation
 #[contracttype]
@@ -36,7 +37,10 @@ pub enum CoverageType {
     Liability = 5,
 }
 
-/// Event categories for logging
+/// Event categories used for logging across all contracts.
+///
+/// Determines the high-level classification of an event. The taxonomy is documented in
+/// `docs/EVENT_TAXONOMY.md`.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -48,7 +52,9 @@ pub enum EventCategory {
     Access = 4,
 }
 
-/// Event priorities for logging
+/// Priority levels for events emitted by contracts.
+/// Determines the importance of the event. Lower numbers represent lower priority.
+/// See `docs/EVENT_TAXONOMY.md` for full taxonomy details.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -74,14 +80,20 @@ impl EventPriority {
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
 pub const MAX_PAGE_LIMIT: u32 = 50;
 
+/// Standardized TTL Constants (Ledger Counts)
+pub const DAY_IN_LEDGERS: u32 = 17280; // ~5 seconds per ledger
+
 /// Storage TTL constants for active data
-/// These constants are defined once - no duplicates
-pub const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
-pub const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
+pub const INSTANCE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS; // 7 days
+pub const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS; // 30 days
+
+/// Storage TTL constants for persistent data
+pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = 15 * DAY_IN_LEDGERS; // 15 days
+pub const PERSISTENT_BUMP_AMOUNT: u32 = 60 * DAY_IN_LEDGERS; // 60 days
 
 /// Storage TTL constants for archived data
-pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
-pub const ARCHIVE_BUMP_AMOUNT: u32 = 2592000; // ~180 days (6 months)
+pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS; // 7 days
+pub const ARCHIVE_BUMP_AMOUNT: u32 = 180 * DAY_IN_LEDGERS; // 180 days (6 months)
 
 /// Signature expiration time (24 hours in seconds)
 pub const SIGNATURE_EXPIRATION: u64 = 86400;
@@ -92,7 +104,23 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// Maximum batch size for operations
 pub const MAX_BATCH_SIZE: u32 = 50;
 
-/// Helper function to clamp limit
+/// Pre-upgrade snapshot version
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// Storage key for pre-upgrade snapshots
+pub const SNAPSHOT_KEY: Symbol = symbol_short!("SNAPSHOT");
+
+/// Normalizes caller-supplied pagination limits for all shared paginated reads.
+///
+/// # Contract
+/// - `0` is treated as a request for the default limit and returns `DEFAULT_PAGE_LIMIT`.
+/// - Values between `1` and `MAX_PAGE_LIMIT` (inclusive) are passed through unchanged.
+/// - Values greater than `MAX_PAGE_LIMIT` are capped at `MAX_PAGE_LIMIT`.
+/// - The returned value is always in `1..=MAX_PAGE_LIMIT`.
+/// - The function is idempotent: applying it to an already-normalized value returns
+///   the same value.
+/// - Extremely large inputs, including `u32::MAX`, clamp without arithmetic and
+///   cannot overflow.
 pub fn clamp_limit(limit: u32) -> u32 {
     if limit == 0 {
         DEFAULT_PAGE_LIMIT
@@ -103,32 +131,237 @@ pub fn clamp_limit(limit: u32) -> u32 {
     }
 }
 
+/// Error related to time and periods.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TimeError {
+    InvalidPeriod = 7,
+}
+
+/// Validates that a requested period is logically ordered.
+///
+/// # Errors
+/// Returns `TimeError::InvalidPeriod` if `start > end`.
+pub fn validate_period(start: u64, end: u64) -> Result<(), TimeError> {
+    if start > end {
+        Err(TimeError::InvalidPeriod)
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tag canonicalization
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed byte length for a single tag.
+pub const TAG_MAX_LEN: u32 = 32;
+
+/// Validation failure returned by [`canonicalize_tags_checked`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagError {
+    /// The tag batch is empty, or an individual tag is zero bytes long.
+    Empty,
+    /// A tag exceeds [`TAG_MAX_LEN`] bytes.
+    TooLong,
+    /// A byte at `position` is not in the allowed charset after upper-case folding.
+    InvalidChar { position: u32 },
+}
+
+/// Signature verification failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignatureError {
+    /// Invalid signature length (must be 64 bytes for Ed25519).
+    InvalidSignatureLength,
+    /// Invalid public key length (must be 32 bytes for Ed25519).
+    InvalidPublicKeyLength,
+    /// Signature verification failed.
+    VerificationFailed,
+}
+
+/// Verify an Ed25519 signature with domain separation.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `domain_separator` - Domain separator to prevent cross-domain replay attacks
+/// * `message` - The message to verify
+/// * `signature` - The Ed25519 signature (64 bytes)
+/// * `public_key` - The Ed25519 public key (32 bytes)
+///
+/// # Returns
+/// * `Ok(())` if the signature is valid
+/// * `Err(SignatureError)` if verification fails
+pub fn verify_signature(
+    env: &soroban_sdk::Env,
+    domain_separator: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    public_key: &[u8],
+) -> Result<(), SignatureError> {
+    if signature.len() != 64 {
+        return Err(SignatureError::InvalidSignatureLength);
+    }
+    if public_key.len() != 32 {
+        return Err(SignatureError::InvalidPublicKeyLength);
+    }
+
+    let mut prefixed_message = Vec::with_capacity(domain_separator.len() + message.len());
+    prefixed_message.extend_from_slice(domain_separator);
+    prefixed_message.extend_from_slice(message);
+
+    let sig_bytes = soroban_sdk::Bytes::from_slice(env, signature);
+    let pk_bytes = soroban_sdk::Bytes::from_slice(env, public_key);
+    let msg_bytes = soroban_sdk::Bytes::from_slice(env, &prefixed_message);
+
+    if soroban_sdk::crypto::ed25519_verify(&pk_bytes, &msg_bytes, &sig_bytes) {
+        Ok(())
+    } else {
+        Err(SignatureError::VerificationFailed)
+    }
+}
+
+/// Validates and canonicalizes a batch of tags without panicking.
+///
+/// # Rules
+/// - The batch must contain at least one tag ([`TagError::Empty`]).
+/// - Each tag must be between 1 and [`TAG_MAX_LEN`] bytes inclusive
+///   ([`TagError::Empty`] for zero length, [`TagError::TooLong`] otherwise).
+/// - Allowed charset: `[a-z0-9\-_]`. ASCII uppercase letters are silently
+///   folded to lowercase; any other byte yields [`TagError::InvalidChar`].
+///
+/// Validation short-circuits on the first violation (empty batch, length, or
+/// invalid byte) for gas efficiency.
+///
+/// # Returns
+/// On success, a new `Vec<String>` containing the normalized (lowercased) tags
+/// in the same order as the input. The function does **not** deduplicate.
+///
+/// # Usage
+/// ```ignore
+/// use remitwise_common::{canonicalize_tags_checked, TagError};
+/// match canonicalize_tags_checked(&env, &tags) {
+///     Ok(normalized) => { /* store normalized */ }
+///     Err(TagError::InvalidChar { .. }) => {
+///         soroban_sdk::panic_with_error!(&env, MyError::InvalidTagContent)
+///     }
+///     Err(TagError::Empty) | Err(TagError::TooLong) => { /* map to caller error */ }
+/// }
+/// ```
+pub fn canonicalize_tags_checked(
+    env: &soroban_sdk::Env,
+    tags: &soroban_sdk::Vec<soroban_sdk::String>,
+) -> Result<soroban_sdk::Vec<soroban_sdk::String>, TagError> {
+    if tags.is_empty() {
+        return Err(TagError::Empty);
+    }
+    let mut out = soroban_sdk::Vec::new(env);
+    for tag in tags.iter() {
+        let len = tag.len();
+        if len == 0 {
+            return Err(TagError::Empty);
+        }
+        if len > TAG_MAX_LEN {
+            return Err(TagError::TooLong);
+        }
+        let mut buf = [0u8; 32];
+        tag.copy_into_slice(&mut buf[..len as usize]);
+        for (position, byte) in buf.iter_mut().take(len as usize).enumerate() {
+            if byte.is_ascii_uppercase() {
+                *byte += b'a' - b'A';
+            }
+            let b = *byte;
+            if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
+                return Err(TagError::InvalidChar {
+                    position: position as u32,
+                });
+            }
+        }
+        let s = match core::str::from_utf8(&buf[..len as usize]) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(TagError::InvalidChar { position: 0 });
+            }
+        };
+        out.push_back(soroban_sdk::String::from_str(env, s));
+    }
+    Ok(out)
+}
+
+/// Validates and canonicalizes a batch of tags, panicking on failure.
+///
+/// This is a thin wrapper around [`canonicalize_tags_checked`] that preserves
+/// the legacy panic-based contract for existing callers. Prefer
+/// [`canonicalize_tags_checked`] when handling untrusted or indexer-supplied
+/// tag strings so errors can be mapped to typed contract errors.
+///
+/// # Rules
+/// - The batch must contain at least one tag (`panic!("Tags cannot be empty")`).
+/// - Each tag must be between 1 and [`TAG_MAX_LEN`] bytes inclusive
+///   (`panic!("Tag must be between 1 and 32 characters")`).
+/// - Allowed charset: `[a-z0-9\-_]`. ASCII uppercase letters are silently
+///   folded to lowercase; any other byte causes the supplied `on_invalid_char`
+///   closure to be called once (typically `panic_with_error!` or `panic!`).
+///
+/// # Returns
+/// A new `Vec<String>` containing the normalized (lowercased) tags in the
+/// same order as the input.
+///
+/// # Usage
+/// ```ignore
+/// use remitwise_common::canonicalize_tags;
+/// let normalized = canonicalize_tags(&env, &tags, || {
+///     soroban_sdk::panic_with_error!(&env, MyError::InvalidTagContent)
+/// });
+/// ```
+pub fn canonicalize_tags<F>(
+    env: &soroban_sdk::Env,
+    tags: &soroban_sdk::Vec<soroban_sdk::String>,
+    on_invalid_char: F,
+) -> soroban_sdk::Vec<soroban_sdk::String>
+where
+    F: Fn(),
+{
+    match canonicalize_tags_checked(env, tags) {
+        Ok(out) => out,
+        Err(TagError::Empty) => {
+            if tags.is_empty() {
+                panic!("Tags cannot be empty");
+            }
+            panic!("Tag must be between 1 and 32 characters");
+        }
+        Err(TagError::TooLong) => panic!("Tag must be between 1 and 32 characters"),
+        Err(TagError::InvalidChar { .. }) => {
+            on_invalid_char();
+            // on_invalid_char must diverge (panic); this is unreachable.
+            soroban_sdk::Vec::new(env)
+        }
+    }
+}
+
 /// Event emission helper
-///
-/// # Deterministic topic naming
-///
-/// All events emitted via `RemitwiseEvents` follow a deterministic topic schema:
-///
-/// 1. A fixed namespace symbol: `"Remitwise"`.
-/// 2. An event category as `u32` (see `EventCategory`).
-/// 3. An event priority as `u32` (see `EventPriority`).
-/// 4. An action `Symbol` describing the specific event or a subtype (e.g. `"created"`).
-///
-/// This ordering allows consumers to index and filter events reliably across contracts.
 pub struct RemitwiseEvents;
 
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod emit_tests;
+
 impl RemitwiseEvents {
-    /// Emit a single event with deterministic topics.
+    /// Emits a single event with the given category, priority, and action.
     ///
-    /// # Parameters
-    /// - `env`: Soroban environment used to publish the event.
-    /// - `category`: Logical event category (`EventCategory`).
-    /// - `priority`: Event priority (`EventPriority`).
-    /// - `action`: A `Symbol` identifying the action or event name.
-    /// - `data`: The serializable payload for the event.
+    /// * `category` – The `EventCategory` describing the type of event.
+    /// * `priority` – The `EventPriority` indicating the importance level.
+    /// * `action` – A short `Symbol` identifying the specific action.
+    /// * `data` – The event payload implementing `IntoVal`.
     ///
-    /// # Security
-    /// Do not include sensitive personal data in `data` because events are publicly visible on-chain.
+    /// The emitted event follows the topic schema defined in `docs/EVENT_TAXONOMY.md`.
+    ///
+    /// **Size Budget**: Event data must be compact (topics + small payload, not bulk records).
+    /// The recommended maximum serialized size for the `data` payload is 256 bytes.
+    /// Oversized payloads will trigger a debug/test assertion.
+    #[allow(unexpected_cfgs)]
     pub fn emit<T>(
         env: &soroban_sdk::Env,
         category: EventCategory,
@@ -144,13 +377,35 @@ impl RemitwiseEvents {
             priority.to_u32(),
             action,
         );
+
+        #[cfg(any(test, feature = "testutils"))]
+        {
+            use soroban_sdk::xdr::ToXdr;
+            use soroban_sdk::TryFromVal;
+            let val = data.into_val(env);
+            use soroban_sdk::xdr::ToXdr;
+            let xdr_bytes = val.to_xdr(env);
+            let size = xdr_bytes.len();
+            if size > 256 {
+                panic!("Event data size {} exceeds 256-byte budget. Emits must be compact.", size);
+            }
+            env.events().publish(topics, val);
+        }
+
+        #[cfg(not(any(test, feature = "testutils")))]
         env.events().publish(topics, data);
     }
 
-    /// Emit a small batch-style event indicating bulk operations.
+    /// Emits a batch event for the given category and action with a count.
     ///
-    /// The `action` parameter is included in the payload rather than as the final topic
-    /// to make the topic schema consistent for batch analytics.
+    /// * `category` – The `EventCategory` of the batched events.
+    /// * `action` – Symbol representing the batch action.
+    /// * `count` – Number of events in the batch.
+    ///
+    /// This always uses `EventPriority::Low` for batch events.
+    ///
+    /// **Size Budget**: Batch payloads (action + count) are inherently compact and conform
+    /// to the recommended event data budget.
     pub fn emit_batch(env: &soroban_sdk::Env, category: EventCategory, action: Symbol, count: u32) {
         let topics = (
             symbol_short!("Remitwise"),
@@ -160,5 +415,201 @@ impl RemitwiseEvents {
         );
         let data = (action, count);
         env.events().publish(topics, data);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding stability tests (cross-contract ABI)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod encoding_stability_tests {
+    use super::{Category, CoverageType, FamilyRole};
+    use soroban_sdk::{Env, Map, Vec};
+
+    fn round_trip<T>(env: &Env, v: T) -> T
+    where
+        T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>
+            + soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        let val = v.into_val(env);
+        T::try_from_val(env, &val).unwrap()
+    }
+
+    fn assert_encoding_matches_discriminant<T>(env: &Env, v: T, expected: u32)
+    where
+        T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>
+            + soroban_sdk::TryFromVal<Env, soroban_sdk::Val>
+            + core::fmt::Debug
+            + PartialEq,
+    {
+        let val = v.into_val(env);
+
+        // `#[repr(u32)]` + `#[contracttype]` should encode via a stable u32 discriminant.
+        // We pin the expected discriminant by decoding the value as `u32`.
+        let actual_u32: u32 = soroban_sdk::TryFromVal::try_from_val(env, &val)
+            .unwrap_or_else(|_| panic!("unexpected Val for encoding: {val:?}"));
+        assert_eq!(actual_u32, expected, "encoding mismatch");
+
+        // And ensure round-trip identity.
+        let decoded = T::try_from_val(env, &val).unwrap();
+        assert_eq!(decoded, v, "round-trip mismatch");
+    }
+
+    #[test]
+    fn category_round_trip_and_encoding_stability() {
+        let env = Env::default();
+
+        assert_encoding_matches_discriminant(&env, Category::Spending, 1);
+        assert_encoding_matches_discriminant(&env, Category::Savings, 2);
+        assert_encoding_matches_discriminant(&env, Category::Bills, 3);
+        assert_encoding_matches_discriminant(&env, Category::Insurance, 4);
+
+        // Exhaustiveness enforcement: every variant must be explicitly handled.
+        fn cover_all_variants(v: Category) {
+            match v {
+                Category::Spending => {}
+                Category::Savings => {}
+                Category::Bills => {}
+                Category::Insurance => {}
+            }
+        }
+
+        for v in [
+            Category::Spending,
+            Category::Savings,
+            Category::Bills,
+            Category::Insurance,
+        ] {
+            cover_all_variants(v);
+        }
+
+        // Container round-trips
+        let vec = Vec::from_array(
+            &env,
+            [Category::Spending, Category::Savings, Category::Bills],
+        );
+        let mut out = Vec::<Category>::new(&env);
+        for item in vec.iter() {
+            out.push_back(round_trip(&env, item));
+        }
+        assert_eq!(out, vec);
+
+        let mut map = Map::<u32, Category>::new(&env);
+        map.set(1u32, Category::Spending);
+        map.set(2u32, Category::Savings);
+        map.set(3u32, Category::Bills);
+
+        let mut out_map = Map::<u32, Category>::new(&env);
+        for (k, v) in map.iter() {
+            out_map.set(k, round_trip(&env, v));
+        }
+        assert_eq!(out_map, map);
+    }
+
+    #[test]
+    fn family_role_round_trip_and_encoding_stability() {
+        let env = Env::default();
+
+        assert_encoding_matches_discriminant(&env, FamilyRole::Owner, 1);
+        assert_encoding_matches_discriminant(&env, FamilyRole::Admin, 2);
+        assert_encoding_matches_discriminant(&env, FamilyRole::Member, 3);
+        assert_encoding_matches_discriminant(&env, FamilyRole::Viewer, 4);
+
+        fn cover_all_variants(v: FamilyRole) {
+            match v {
+                FamilyRole::Owner => {}
+                FamilyRole::Admin => {}
+                FamilyRole::Member => {}
+                FamilyRole::Viewer => {}
+            }
+        }
+
+        for v in [
+            FamilyRole::Owner,
+            FamilyRole::Admin,
+            FamilyRole::Member,
+            FamilyRole::Viewer,
+        ] {
+            cover_all_variants(v);
+        }
+
+        let vec = Vec::from_array(
+            &env,
+            [FamilyRole::Owner, FamilyRole::Admin, FamilyRole::Viewer],
+        );
+        let mut out = Vec::<FamilyRole>::new(&env);
+        for item in vec.iter() {
+            out.push_back(round_trip(&env, item));
+        }
+        assert_eq!(out, vec);
+
+        let mut map = Map::<u32, FamilyRole>::new(&env);
+        map.set(1u32, FamilyRole::Owner);
+        map.set(2u32, FamilyRole::Admin);
+        map.set(3u32, FamilyRole::Viewer);
+
+        let mut out_map = Map::<u32, FamilyRole>::new(&env);
+        for (k, v) in map.iter() {
+            out_map.set(k, round_trip(&env, v));
+        }
+        assert_eq!(out_map, map);
+    }
+
+    #[test]
+    fn coverage_type_round_trip_and_encoding_stability() {
+        let env = Env::default();
+
+        assert_encoding_matches_discriminant(&env, CoverageType::Health, 1);
+        assert_encoding_matches_discriminant(&env, CoverageType::Life, 2);
+        assert_encoding_matches_discriminant(&env, CoverageType::Property, 3);
+        assert_encoding_matches_discriminant(&env, CoverageType::Auto, 4);
+        assert_encoding_matches_discriminant(&env, CoverageType::Liability, 5);
+
+        fn cover_all_variants(v: CoverageType) {
+            match v {
+                CoverageType::Health => {}
+                CoverageType::Life => {}
+                CoverageType::Property => {}
+                CoverageType::Auto => {}
+                CoverageType::Liability => {}
+            }
+        }
+
+        for v in [
+            CoverageType::Health,
+            CoverageType::Life,
+            CoverageType::Property,
+            CoverageType::Auto,
+            CoverageType::Liability,
+        ] {
+            cover_all_variants(v);
+        }
+
+        let vec = Vec::from_array(
+            &env,
+            [
+                CoverageType::Health,
+                CoverageType::Life,
+                CoverageType::Property,
+                CoverageType::Auto,
+            ],
+        );
+        let mut out = Vec::<CoverageType>::new(&env);
+        for item in vec.iter() {
+            out.push_back(round_trip(&env, item));
+        }
+        assert_eq!(out, vec);
+
+        let mut map = Map::<u32, CoverageType>::new(&env);
+        map.set(1u32, CoverageType::Health);
+        map.set(2u32, CoverageType::Life);
+        map.set(3u32, CoverageType::Liability);
+
+        let mut out_map = Map::<u32, CoverageType>::new(&env);
+        for (k, v) in map.iter() {
+            out_map.set(k, round_trip(&env, v));
+        }
+        assert_eq!(out_map, map);
     }
 }

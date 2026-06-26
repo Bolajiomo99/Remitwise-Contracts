@@ -200,6 +200,14 @@
                                   },
                                   {
                                     "key": {
+                                      "symbol": "tags"
+                                    },
+                                    "val": {
+                                      "vec": []
+                                    }
+                                  },
+                                  {
+                                    "key": {
                                       "symbol": "target_amount"
                                     },
                                     "val": {
@@ -741,7 +749,7 @@
             ],
             "data": {
               "error": {
-                "contract": 2
+                "contract": 6
               }
             }
           }
@@ -762,7 +770,7 @@
               },
               {
                 "error": {
-                  "contract": 2
+                  "contract": 6
                 }
               }
             ],
@@ -787,7 +795,7 @@
               },
               {
                 "error": {
-                  "contract": 2
+                  "contract": 6
                 }
               }
             ],
@@ -835,7 +843,7 @@
               },
               {
                 "error": {
-                  "contract": 2
+                  "contract": 6
                 }
               }
             ],

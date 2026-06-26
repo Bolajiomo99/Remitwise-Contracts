@@ -77,12 +77,16 @@ fn stress_200_goals_single_user() {
     let target_date = 2_000_000_000u64;
 
     for _ in 0..200 {
-        client.create_goal(&owner, &name, &1_000i128, &target_date);
+        client.create_goal(&owner, &name, &1_000i128, &target_date, &false);
     }
 
     // Verify via get_all_goals (unbounded)
     let all_goals = client.get_all_goals(&owner);
-    assert_eq!(all_goals.len(), 200, "get_all_goals must return all 200 goals");
+    assert_eq!(
+        all_goals.len(),
+        200,
+        "get_all_goals must return all 200 goals"
+    );
 
     // Verify via paginated get_goals (MAX_PAGE_LIMIT = 50 → 4 pages)
     let mut collected = 0u32;
@@ -103,11 +107,18 @@ fn stress_200_goals_single_user() {
         cursor = page.next_cursor;
     }
 
-    assert_eq!(collected, 200, "Paginated get_goals must return all 200 goals");
+    assert_eq!(
+        collected, 200,
+        "Paginated get_goals must return all 200 goals"
+    );
     // get_goals sets next_cursor = last_returned_id; when a page is exactly full the
     // caller receives a non-zero cursor that produces a trailing empty page, so the
     // number of round-trips is pages = ceil(200/50) + 1 trailing = 5.
-    assert!(pages >= 4 && pages <= 5, "Expected 4-5 pages for 200 goals at limit 50, got {}", pages);
+    assert!(
+        (4..=5).contains(&pages),
+        "Expected 4-5 pages for 200 goals at limit 50, got {}",
+        pages
+    );
 }
 
 /// Create 200 goals and verify instance TTL stays valid after the instance Map
@@ -122,7 +133,7 @@ fn stress_instance_ttl_valid_after_200_goals() {
     let name = String::from_str(&env, "TTLGoal");
 
     for _ in 0..200 {
-        client.create_goal(&owner, &name, &500i128, &2_000_000_000u64);
+        client.create_goal(&owner, &name, &500i128, &2_000_000_000u64, &false);
     }
 
     let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -154,7 +165,7 @@ fn stress_goals_across_10_users() {
 
     for user in &users {
         for _ in 0..GOALS_PER_USER {
-            client.create_goal(user, &name, &1_000i128, &target_date);
+            client.create_goal(user, &name, &1_000i128, &target_date, &false);
         }
     }
 
@@ -190,7 +201,7 @@ fn stress_ttl_re_bumped_after_ledger_advancement() {
 
     // Phase 1: 50 creates
     for _ in 0..50 {
-        client.create_goal(&owner, &name, &1_000i128, &2_000_000_000u64);
+        client.create_goal(&owner, &name, &1_000i128, &2_000_000_000u64, &false);
     }
 
     let ttl_batch1 = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -220,7 +231,7 @@ fn stress_ttl_re_bumped_after_ledger_advancement() {
     );
 
     // Phase 3: create_goal fires extend_ttl → re-bumped
-    client.create_goal(&owner, &name, &1_000i128, &2_000_000_000u64);
+    client.create_goal(&owner, &name, &1_000i128, &2_000_000_000u64, &false);
 
     let ttl_rebumped = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
     assert!(
@@ -243,6 +254,7 @@ fn stress_ttl_re_bumped_by_add_to_goal_after_ledger_advancement() {
         &String::from_str(&env, "AddTTL"),
         &10_000i128,
         &2_000_000_000u64,
+        &false,
     );
 
     // Advance ledger so TTL drops below threshold
@@ -292,6 +304,7 @@ fn stress_batch_add_to_goals_at_max_batch_size() {
             &String::from_str(&env, "BatchGoal"),
             &1_000i128,
             &target_date,
+            &false,
         );
         goal_ids.push(id);
     }
@@ -355,6 +368,7 @@ fn stress_data_persists_across_multiple_ledger_advancements() {
             &String::from_str(&env, "Phase1"),
             &1_000i128,
             &2_000_000_000u64,
+            &false,
         );
     }
     assert_eq!(client.get_all_goals(&owner).len(), 30);
@@ -376,6 +390,7 @@ fn stress_data_persists_across_multiple_ledger_advancements() {
             &String::from_str(&env, "Phase2"),
             &2_000i128,
             &2_100_000_000u64,
+            &false,
         );
     }
     assert_eq!(
@@ -404,7 +419,10 @@ fn stress_data_persists_across_multiple_ledger_advancements() {
 
     // TTL must still be positive
     let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-    assert!(ttl > 0, "Instance TTL must be > 0 after all ledger advancements");
+    assert!(
+        ttl > 0,
+        "Instance TTL must be > 0 after all ledger advancements"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +439,7 @@ fn bench_get_all_goals_200_goals() {
 
     let name = String::from_str(&env, "BenchGoal");
     for _ in 0..200 {
-        client.create_goal(&owner, &name, &1_000i128, &1_800_000_000u64);
+        client.create_goal(&owner, &name, &1_000i128, &1_800_000_000u64, &false);
     }
 
     let (cpu, mem, goals) = measure(&env, || client.get_all_goals(&owner));
@@ -443,7 +461,7 @@ fn bench_get_goals_first_page_of_200() {
 
     let name = String::from_str(&env, "BenchPageGoal");
     for _ in 0..200 {
-        client.create_goal(&owner, &name, &1_000i128, &1_800_000_000u64);
+        client.create_goal(&owner, &name, &1_000i128, &1_800_000_000u64, &false);
     }
 
     let (cpu, mem, page) = measure(&env, || client.get_goals(&owner, &0u32, &50u32));
@@ -470,6 +488,7 @@ fn bench_batch_add_to_goals_50_contributions() {
             &String::from_str(&env, "BatchBench"),
             &10_000i128,
             &2_000_000_000u64,
+            &false,
         );
         goal_ids.push(id);
     }

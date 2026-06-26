@@ -1,198 +1,339 @@
-#![no_std]
-
-use soroban_sdk::{contract, contracterror, contractimpl, symbol_short, Address, Env, Symbol};
-
-// ---------------------------------------------------------------------------
-// Storage Keys
-// ---------------------------------------------------------------------------
-
-const KEY_ADMIN: Symbol = symbol_short!("ADMIN");
-const KEY_PAUSED: Symbol = symbol_short!("PAUSED");
-const KEY_UNP_AT: Symbol = symbol_short!("UNP_AT");
-
-// ---------------------------------------------------------------------------
-// Error codes
-// ---------------------------------------------------------------------------
+﻿#![no_std]
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    /// `initialize` was never called.
-    NotInitialized = 1,
-    /// `initialize` has already been called.
+    Unauthorized = 1,
     AlreadyInitialized = 2,
-    /// Caller is not the current admin.
-    Unauthorized = 3,
-    /// The contract (or target function) is paused.
-    ContractPaused = 4,
-    /// Scheduled-unpause timestamp must be in the future.
+    NotInitialized = 3,
+    LimitExceeded = 4,
     InvalidSchedule = 5,
+    InvalidAdmin = 6,
 }
 
-// ---------------------------------------------------------------------------
-// Events
-// ---------------------------------------------------------------------------
-
-/// Thin helper – keeps event topic construction in one place.
-fn emit(env: &Env, action: Symbol) {
-    env.events()
-        .publish((symbol_short!("killswtch"), action), ());
+#[contracttype]
+#[derive(Clone)]
+enum DataKey {
+    Admin,
+    GlobalPaused,
+    ModulePaused(Symbol),
+    PausedFunctions(Symbol),
+    UnpauseSchedule,
 }
 
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
+pub const MAX_PAUSED_FUNCTIONS: u32 = 10;
+
+/// Emitted when the killswitch admin is successfully transferred.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminTransferred {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub timestamp: u64,
+}
 
 #[contract]
 pub struct EmergencyKillswitch;
 
 #[contractimpl]
 impl EmergencyKillswitch {
-    // -----------------------------------------------------------------------
-    // Initialization
-    // -----------------------------------------------------------------------
-
-    /// One-shot setup. Stores `admin` and leaves the contract unpaused.
-    /// Fails with `AlreadyInitialized` if called a second time.
+    /// Initializes the killswitch with an admin address.
+    ///
+    /// Rejects the contract's own address as admin to prevent unrecoverable bricking.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        if admin == env.current_contract_address() {
+            return Err(Error::InvalidAdmin);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
+    }
+
+    /// Transfers admin authority to a new address.
+    ///
+    /// # Rejects
+    /// - `new_admin` == contract own address (unrecoverable brick)
+    /// - `new_admin` == current admin (no-op, to prevent accidental re-auth)
+    ///
+    /// Emits [AdminTransferred] on successful handover.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if new_admin == env.current_contract_address() {
+            return Err(Error::InvalidAdmin);
+        }
+        if new_admin == admin {
+            return Err(Error::InvalidAdmin);
+        }
+
+        let old_admin = admin.clone();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("emergency"), symbol_short!("admn_xfer")),
+            AdminTransferred {
+                old_admin,
+                new_admin: new_admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::GlobalPaused, &true);
+        env.storage().instance().remove(&DataKey::UnpauseSchedule);
+        env.events().publish(
+            (symbol_short!("emergency"), symbol_short!("paused")),
+            (symbol_short!("GLOBAL"), env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let schedule: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UnpauseSchedule)
+            .ok_or(Error::InvalidSchedule)?;
+        if env.ledger().timestamp() < schedule {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::GlobalPaused, &false);
+        env.storage().instance().remove(&DataKey::UnpauseSchedule);
+        env.events().publish(
+            (symbol_short!("emergency"), symbol_short!("unpaused")),
+            (symbol_short!("GLOBAL"), env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Admin-only recovery path that immediately clears the global emergency
+    /// pause, bypassing the unpause timelock.
+    ///
+    /// [unpause] can only succeed once a future [schedule_unpause] has been set
+    /// *and* the ledger has reached it. A re-[pause] removes any pending
+    /// schedule (see [pause]), so a contract can be left globally paused with no
+    /// valid schedule — at which point `unpause` fails with
+    /// [Error::InvalidSchedule] and the only options were to wait out a stale
+    /// schedule or redeploy. This entrypoint lets the admin recover from that
+    /// stuck-paused state in a single call.
+    ///
+    /// Sets [DataKey::GlobalPaused] to `false` and removes any pending
+    /// [DataKey::UnpauseSchedule]. It is idempotent: calling it when the
+    /// contract is not paused is a successful no-op. Module- and function-level
+    /// pauses are intentionally left untouched — lift those with
+    /// [unpause_module] / [unpause_function].
+    ///
+    /// Emits an `emergency`/`cleared` event on success.
+    pub fn clear_emergency_state(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::GlobalPaused, &false);
+        env.storage().instance().remove(&DataKey::UnpauseSchedule);
+        env.events().publish(
+            (symbol_short!("emergency"), symbol_short!("cleared")),
+            (symbol_short!("GLOBAL"), env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    pub fn schedule_unpause(env: Env, time: u64) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if time < env.ledger().timestamp() {
+            return Err(Error::InvalidSchedule);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::UnpauseSchedule, &time);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::GlobalPaused)
+            .unwrap_or(false)
+    }
+
+    /// Returns the pending unpause timestamp set by `schedule_unpause`, or `None` if no unpause
+    /// is scheduled. The schedule is cleared when `pause` or `unpause` is called.
+    ///
+    /// No authentication required — the schedule is observable on-chain.
+    pub fn get_unpause_schedule(env: Env) -> Option<u64> {
+        env.storage().instance().get(&DataKey::UnpauseSchedule)
+    }
+
+    /// Returns the list of paused function names for `module_id`, or an empty vec if none.
+    ///
+    /// Bounded by [`MAX_PAUSED_FUNCTIONS`] (10); no pagination required.
+    ///
+    /// Note: a function may appear unpaused here yet still be blocked if the module
+    /// (`is_module_paused`) or global pause (`is_paused`) is active — the precedence order
+    /// is global → module → function.
+    ///
+    /// No authentication required — state is observable on-chain.
+    pub fn list_paused_functions(env: Env, module_id: Symbol) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PausedFunctions(module_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns whether `module_id` is directly paused via `pause_module`.
+    ///
+    /// Note: this reflects only the module-level flag. For the full precedence check
+    /// (global → module → function) use `is_function_paused`.
+    ///
+    /// No authentication required — state is observable on-chain.
+    pub fn is_module_paused(env: Env, module_id: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ModulePaused(module_id))
+            .unwrap_or(false)
+    }
+
+    pub fn pause_function(env: Env, module_id: Symbol, func: Symbol) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let mut paused_funcs: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedFunctions(module_id.clone()))
+            .unwrap_or(Vec::new(&env));
+        if !paused_funcs.contains(func.clone()) {
+            if paused_funcs.len() >= MAX_PAUSED_FUNCTIONS {
+                return Err(Error::LimitExceeded);
+            }
+            paused_funcs.push_back(func.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::PausedFunctions(module_id.clone()), &paused_funcs);
+            env.events().publish(
+                (symbol_short!("emergency"), symbol_short!("f_paused")),
+                (module_id, func, env.ledger().timestamp()),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn unpause_function(env: Env, module_id: Symbol, func: Symbol) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let mut paused_funcs: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedFunctions(module_id.clone()))
+            .unwrap_or(Vec::new(&env));
+        if let Some(index) = paused_funcs.first_index_of(func.clone()) {
+            paused_funcs.remove(index);
+            env.storage()
+                .instance()
+                .set(&DataKey::PausedFunctions(module_id.clone()), &paused_funcs);
+            env.events().publish(
+                (symbol_short!("emergency"), symbol_short!("f_unpause")),
+                (module_id, func, env.ledger().timestamp()),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn is_function_paused(env: Env, module_id: Symbol, func: Symbol) -> bool {
         if env
             .storage()
             .instance()
-            .get::<_, Address>(&KEY_ADMIN)
-            .is_some()
+            .get(&DataKey::GlobalPaused)
+            .unwrap_or(false)
         {
-            return Err(Error::AlreadyInitialized);
+            return true;
         }
-        env.storage().instance().set(&KEY_ADMIN, &admin);
-        env.storage().instance().set(&KEY_PAUSED, &false);
-        Ok(())
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::ModulePaused(module_id.clone()))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let paused_funcs: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedFunctions(module_id))
+            .unwrap_or(Vec::new(&env));
+        paused_funcs.contains(func)
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    fn admin(env: &Env) -> Result<Address, Error> {
+    pub fn pause_module(env: Env, module_id: Symbol) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
         env.storage()
             .instance()
-            .get(&KEY_ADMIN)
-            .ok_or(Error::NotInitialized)
-    }
-
-    fn check_admin(env: &Env, caller: &Address) -> Result<(), Error> {
-        let admin = Self::admin(env)?;
-        if admin != *caller {
-            return Err(Error::Unauthorized);
-        }
+            .set(&DataKey::ModulePaused(module_id.clone()), &true);
+        env.events().publish(
+            (symbol_short!("emergency"), symbol_short!("m_paused")),
+            (module_id, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
-    fn assert_not_paused(env: &Env) -> Result<(), Error> {
-        let paused: bool = env.storage().instance().get(&KEY_PAUSED).unwrap_or(false);
-        if paused {
-            Err(Error::ContractPaused)
-        } else {
-            Ok(())
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Pause controls
-    // -----------------------------------------------------------------------
-
-    /// Pause the contract. Only the admin may call this.
-    /// Emits a `"paused"` event.
-    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
-        caller.require_auth();
-        Self::check_admin(&env, &caller)?;
-        env.storage().instance().set(&KEY_PAUSED, &true);
-        emit(&env, symbol_short!("paused"));
+    pub fn unpause_module(env: Env, module_id: Symbol) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::ModulePaused(module_id.clone()), &false);
+        env.events().publish(
+            (symbol_short!("emergency"), symbol_short!("m_unpause")),
+            (module_id, env.ledger().timestamp()),
+        );
         Ok(())
-    }
-
-    /// Unpause the contract. Only the admin may call this.
-    /// If a scheduled-unpause timestamp has been set, the current ledger time
-    /// must be ≥ that timestamp, otherwise returns `ContractPaused`.
-    /// Emits an `"unpaused"` event.
-    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
-        caller.require_auth();
-        Self::check_admin(&env, &caller)?;
-
-        // Honour any scheduled delay.
-        let unp_at: Option<u64> = env.storage().instance().get(&KEY_UNP_AT);
-        if let Some(at) = unp_at {
-            if env.ledger().timestamp() < at {
-                return Err(Error::ContractPaused);
-            }
-            env.storage().instance().remove(&KEY_UNP_AT);
-        }
-
-        env.storage().instance().set(&KEY_PAUSED, &false);
-        emit(&env, symbol_short!("unpaused"));
-        Ok(())
-    }
-
-    /// Set a future timestamp before which `unpause` will be rejected.
-    /// This gives operators a mandatory cooling-off period after an incident.
-    pub fn schedule_unpause(env: Env, caller: Address, at_timestamp: u64) -> Result<(), Error> {
-        caller.require_auth();
-        Self::check_admin(&env, &caller)?;
-
-        if at_timestamp <= env.ledger().timestamp() {
-            return Err(Error::InvalidSchedule);
-        }
-        env.storage().instance().set(&KEY_UNP_AT, &at_timestamp);
-        Ok(())
-    }
-
-    /// Transfer admin rights to `new_admin`. Only the current admin may call
-    /// this. The new admin takes effect immediately.
-    pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
-        caller.require_auth();
-        Self::check_admin(&env, &caller)?;
-        env.storage().instance().set(&KEY_ADMIN, &new_admin);
-        emit(&env, symbol_short!("adm_xfr"));
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Representative guarded operations
-    // (demonstrate the pause-check pattern; no real token movement)
-    // -----------------------------------------------------------------------
-
-    /// Simulated mutating transfer — blocked while paused.
-    pub fn do_transfer(env: Env, caller: Address, _amount: i128) -> Result<(), Error> {
-        caller.require_auth();
-        Self::assert_not_paused(&env)?;
-        // Real implementation would move tokens here.
-        Ok(())
-    }
-
-    /// Simulated mint — blocked while paused.
-    pub fn do_mint(env: Env, caller: Address, _amount: i128) -> Result<(), Error> {
-        caller.require_auth();
-        Self::assert_not_paused(&env)?;
-        // Real implementation would mint tokens here.
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Read-only queries (always available, even while paused)
-    // -----------------------------------------------------------------------
-
-    /// Returns `true` when the contract is globally paused.
-    pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&KEY_PAUSED).unwrap_or(false)
-    }
-
-    /// Returns the current admin address, or `None` if not yet initialized.
-    pub fn get_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&KEY_ADMIN)
-    }
-
-    /// Returns the scheduled-unpause timestamp, if one has been set.
-    pub fn get_scheduled_unpause(env: Env) -> Option<u64> {
-        env.storage().instance().get(&KEY_UNP_AT)
     }
 }

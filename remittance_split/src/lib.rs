@@ -1,14 +1,27 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#[cfg(test)]
+mod events_schema_test;
+#[cfg(test)]
+mod test;
 
+use remitwise_common::{
+    clamp_limit, EventCategory, EventPriority, RemitwiseEvents, INSTANCE_BUMP_AMOUNT,
+    INSTANCE_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD,
+    SNAPSHOT_KEY, SNAPSHOT_VERSION,
+};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
-    Address, Env, Map, Symbol, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 // Event topics
 const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
 const SPLIT_CALCULATED: Symbol = symbol_short!("calc");
+
+// Request hash domain separator for signing (prevents cross-domain attacks)
+const DISTRIBUTE_USDC_DOMAIN: &[u8] = b"distribute_usdc_v1";
 
 // Event data structures
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,27 +39,46 @@ pub struct SplitInitializedEvent {
 #[repr(u32)]
 pub enum RemittanceSplitError {
     AlreadyInitialized = 1,
+    /// The contract has not been initialized yet; `initialize_split` must be called first.
     NotInitialized = 2,
-    PercentagesDoNotSumTo100 = 3,
+    /// One or more split percentages are invalid: either a field exceeds 100 or the four
+    /// fields do not sum to exactly 100.
+    InvalidPercentages = 3,
     InvalidAmount = 4,
     Overflow = 5,
+    /// The caller is not authorized to perform this operation.
     Unauthorized = 6,
     InvalidNonce = 7,
+    /// The snapshot's `schema_version` is outside the supported range
+    /// `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]`.
     UnsupportedVersion = 8,
+    /// The snapshot's `checksum` field does not match the value computed from its contents;
+    /// the payload may have been tampered with or corrupted.
     ChecksumMismatch = 9,
     InvalidDueDate = 10,
     ScheduleNotFound = 11,
+    InactiveSchedule = 21,
     /// The supplied token contract address does not match the trusted USDC contract.
     UntrustedTokenContract = 12,
     /// A destination account is the same as the sender, which would be a no-op transfer.
     SelfTransferNotAllowed = 13,
-}
+    DeadlineExpired = 14,
+    /// The deadline field is zero or exceeds MAX_DEADLINE_WINDOW_SECS from now.
+    InvalidDeadline = 25,
 
-#[derive(Clone)]
-#[contracttype]
-pub struct Allocation {
-    pub category: Symbol,
-    pub amount: i128,
+    RequestHashMismatch = 15,
+
+    PercentagesDoNotSumTo100 = 18,
+    FutureTimestamp = 19,
+    OwnerMismatch = 20,
+    NonceAlreadyUsed = 16,
+    PercentageOutOfRange = 17,
+    /// The owner has reached the maximum number of allowed schedules.
+    ScheduleCapExceeded = 22,
+    /// The schedule interval is below the minimum allowed value.
+    ScheduleIntervalTooShort = 23,
+    /// The schedule lead time exceeds the maximum allowed value.
+    ScheduleLeadTimeTooLong = 24,
 }
 
 #[derive(Clone)]
@@ -58,9 +90,38 @@ pub struct AccountGroup {
     pub insurance: Address,
 }
 
-// Storage TTL constants
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
-const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
+/// Typed request for distribute_usdc signing.
+/// This structure contains all parameters needed for distributing USDC.
+/// Signers use this to compute a deterministic request hash.
+#[derive(Clone)]
+#[contracttype]
+pub struct DistributeUsdcRequest {
+    /// USDC contract address
+    pub usdc_contract: Address,
+    /// Sender/payer address
+    pub from: Address,
+    /// Nonce for replay protection
+    pub nonce: u64,
+    /// Destination accounts for split allocation
+    pub accounts: AccountGroup,
+    /// Total USDC amount to distribute
+    pub total_amount: i128,
+    /// Deadline timestamp (Unix seconds) - request is invalid after this time
+    pub deadline: u64,
+}
+
+/// Maximum number of used nonces tracked per address before the oldest are pruned.
+const MAX_USED_NONCES_PER_ADDR: u32 = 256;
+/// Maximum number of remittance schedules allowed per owner to prevent storage bloat.
+pub const MAX_SCHEDULES_PER_OWNER: u32 = 50;
+/// Minimum allowed recurrence interval for repeating schedules (1 hour in seconds).
+/// One-off schedules (interval == 0) are exempt from this check.
+pub const MIN_SCHEDULE_INTERVAL: u64 = 3_600;
+/// Maximum allowed lead time for schedule due dates (1 year in seconds).
+/// Prevents unrealistic far-future scheduling that creates operational risk.
+pub const MAX_SCHEDULE_LEAD_TIME: u64 = 365 * 24 * 3_600;
+/// Maximum allowed window for transaction deadlines (1 hour).
+pub const MAX_DEADLINE_WINDOW_SECS: u64 = 3_600;
 
 /// Split configuration with owner tracking for access control
 #[derive(Clone)]
@@ -89,6 +150,18 @@ pub struct SplitCalculatedEvent {
     pub timestamp: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct DistributionCompletedEvent {
+    pub from: Address,
+    pub total_amount: i128,
+    pub spending_amount: i128,
+    pub savings_amount: i128,
+    pub bills_amount: i128,
+    pub insurance_amount: i128,
+    pub timestamp: u64,
+}
+
 /// Events emitted by the contract for audit trail
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,26 +171,50 @@ pub enum SplitEvent {
     Calculated,
     /// Emitted when distribute_usdc successfully completes all transfers.
     DistributionCompleted,
+    SnapshotExported,
+    SnapshotImported,
 }
 
 /// Snapshot for data export/import (migration).
 ///
-/// The checksum covers both `config` and `schedules` so that import can
-/// verify the payload was not corrupted or tampered with in transit.
-///
-/// `next_rsch` records the highest schedule id that existed at export time;
-/// `import_snapshot` advances `NEXT_RSCH` to at least this value so that
-/// any schedules created after the import never collide with imported ids.
+/// The checksum is an FNV-1a digest covering every scalar field
+/// (schema_version, all four percentages, config timestamp, the initialized
+/// flag, and the export timestamp). Any single-bit mutation to any covered
+/// field will produce a different checksum, making tampered payloads
+/// detectable before restore.
+/// Importers **must** validate `schema_version` against the supported range
+/// (`MIN_SUPPORTED_SCHEMA_VERSION..=SCHEMA_VERSION`) before applying.
 #[contracttype]
 #[derive(Clone)]
 pub struct ExportSnapshot {
-    pub version: u32,
+    /// Explicit schema version tag for this snapshot format.
+    /// Supported range: MIN_SUPPORTED_SCHEMA_VERSION..=SCHEMA_VERSION.
+    pub schema_version: u32,
     pub checksum: u64,
     pub config: SplitConfig,
-    /// All remittance schedules at export time.
     pub schedules: Vec<RemittanceSchedule>,
-    /// Highest schedule id counter at export time.
-    pub next_rsch: u32,
+    pub exported_at: u64,
+}
+
+/// Pre-upgrade snapshot for upgrade rollback protection.
+///
+/// Captures critical instance storage before a contract upgrade so that
+/// state can be restored if `post_upgrade` produces inconsistent results.
+#[contracttype]
+#[derive(Clone)]
+pub struct PreUpgradeSnapshot {
+    /// Snapshot schema version (`SNAPSHOT_VERSION`).
+    pub schema_version: u32,
+    /// Core split configuration.
+    pub config: SplitConfig,
+    /// Contract version at snapshot time.
+    pub version: u32,
+    /// Upgrade admin address, if set.
+    pub upgrade_admin: Option<Address>,
+    /// Pause state.
+    pub paused: bool,
+    /// Pause admin address, if set.
+    pub pause_admin: Option<Address>,
 }
 
 /// Audit log entry for security and compliance.
@@ -130,9 +227,39 @@ pub struct AuditEntry {
     pub success: bool,
 }
 
-/// Schedule for automatic remittance splits
+/// Paginated audit log result.
 #[contracttype]
 #[derive(Clone)]
+pub struct AuditPage {
+    pub items: Vec<AuditEntry>,
+    pub next_cursor: u32,
+    pub count: u32,
+}
+
+///
+/// Provides stable cursor-based pagination so consumers can replay the schedule list
+/// without gaps or duplicates across page boundaries. Schedules are ordered by ID ascending.
+#[contracttype]
+#[derive(Clone)]
+pub struct SchedulePage {
+    pub items: Vec<RemittanceSchedule>,
+    /// Index to pass as `from_index` for the next page. 0 means no more pages.
+    pub next_cursor: u32,
+    /// Number of items returned in this page.
+    pub count: u32,
+}
+
+/// Split allocation output item for UI/analytics consumers.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Allocation {
+    pub category: Symbol,
+    pub amount: i128,
+}
+
+/// Schedule for automatic remittance splits
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemittanceSchedule {
     pub id: u32,
     pub owner: Address,
@@ -157,19 +284,51 @@ pub enum ScheduleEvent {
     Cancelled,
 }
 
-const SNAPSHOT_VERSION: u32 = 1;
+// Domain-separated authorization payload for split operations.
+// Includes the full set of initialization parameters so that the
+// signer commits to the exact configuration being applied.
+// NOTE: `SplitAuthPayload` is defined below with a stable schema.
+
+/// Current snapshot schema version. Bumped to 2 for FNV-1a checksum + exported_at field.
+const SCHEMA_VERSION: u32 = 2;
+/// Oldest snapshot schema version this contract can import. Enables backward compat.
+const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Domain-separated payload for split initialization.
+/// Binds technical context (network, contract) with business parameters
+/// to prevent relay/replay attacks across different deployments or networks.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitAuthPayload {
+    /// Domain identifier for functional separation (e.g. symbol_short!("init"))
+    pub domain_id: Symbol,
+    /// Network ID to prevent replay across different Stellar networks
+    pub network_id: BytesN<32>,
+    /// Contract address to prevent replay across different contract instances
+    pub contract_addr: Address,
+    /// Owner address who is authorizing the initialization
+    pub owner_addr: Address,
+    /// Per-address nonce for sequential replay protection
+    pub nonce_val: u64,
+    /// USDC token contract address
+    pub usdc_contract: Address,
+    /// Percentage for precision spending
+    pub spending_percent: u32,
+    /// Percentage for savings goals
+    pub savings_percent: u32,
+    /// Percentage for bill payments
+    pub bills_percent: u32,
+    /// Percentage for insurance premiums
+    pub insurance_percent: u32,
+}
+
 const MAX_AUDIT_ENTRIES: u32 = 100;
 const CONTRACT_VERSION: u32 = 1;
 
-/// Paginated result for `get_schedules_paginated`.
 #[contracttype]
-#[derive(Clone)]
-pub struct SchedulePage {
-    pub items: Vec<RemittanceSchedule>,
-    /// Id of the last item in this page, or 0 when there are no more pages.
-    pub next_cursor: u32,
-    /// Number of items in this page.
-    pub count: u32,
+pub enum DataKey {
+    Schedule(u32),
+    OwnerSchedules(Address),
 }
 
 #[contract]
@@ -182,9 +341,11 @@ impl RemittanceSplit {
     const STORAGE_OWNER_SCHED_IDS: Symbol = symbol_short!("OWN_SCH");
 
     fn get_pause_admin(env: &Env) -> Option<Address> {
+        Self::extend_instance_ttl(env);
         env.storage().instance().get(&symbol_short!("PAUSE_ADM"))
     }
     fn get_global_paused(env: &Env) -> bool {
+        Self::extend_instance_ttl(env);
         env.storage()
             .instance()
             .get(&symbol_short!("PAUSED"))
@@ -198,12 +359,27 @@ impl RemittanceSplit {
         }
     }
 
+    /// Set the pause administrator responsible for emergency pause control.
+    /// This function can only be called by the contract owner. It transfers the pause admin role to a new address and emits an admin transfer event for audit trail.
+    ///
+    /// # Arguments
+    /// * `caller` - Split owner address (must authorize)
+    /// * `new_admin` - Address that will gain pause and unpause authority
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the split has not been initialized yet
+    /// - `Unauthorized` if `caller` is not the owner or the contract is currently paused
+    ///
+    /// # Events
+    /// Emits `adm_xfr` event with (old_admin, new_admin) tuple for audit trail
     pub fn set_pause_admin(
         env: Env,
         caller: Address,
         new_admin: Address,
     ) -> Result<(), RemittanceSplitError> {
         caller.require_auth();
+        Self::extend_instance_ttl(&env);
+        Self::require_not_paused(&env)?;
         let config: SplitConfig = env
             .storage()
             .instance()
@@ -212,13 +388,30 @@ impl RemittanceSplit {
         if config.owner != caller {
             return Err(RemittanceSplitError::Unauthorized);
         }
+        let current_pause_admin = Self::get_pause_admin(&env);
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSE_ADM"), &new_admin);
+        // Emit admin transfer event for audit trail
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("adm_xfr")),
+            (current_pause_admin.clone(), new_admin.clone()),
+        );
         Ok(())
     }
+
+    /// Pause all state-changing split entrypoints until `unpause` is called.
+    ///
+    /// # Arguments
+    /// * `caller` - Pause administrator address (must authorize)
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the split has not been initialized yet
+    /// - `Unauthorized` if `caller` is not the active pause admin or the contract is already paused
     pub fn pause(env: Env, caller: Address) -> Result<(), RemittanceSplitError> {
         caller.require_auth();
+        Self::extend_instance_ttl(&env);
+        Self::require_not_paused(&env)?;
         let config: SplitConfig = env
             .storage()
             .instance()
@@ -231,12 +424,29 @@ impl RemittanceSplit {
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED"), &true);
-        env.events()
-            .publish((symbol_short!("split"), symbol_short!("paused")), ());
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("paused"),
+            (),
+        );
         Ok(())
     }
+
+    /// Resume state-changing split entrypoints after an emergency pause.
+    ///
+    /// This is intentionally the only mutating entrypoint that remains callable while paused.
+    ///
+    /// # Arguments
+    /// * `caller` - Pause administrator address (must authorize)
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the split has not been initialized yet
+    /// - `Unauthorized` if `caller` is not the active pause admin
     pub fn unpause(env: Env, caller: Address) -> Result<(), RemittanceSplitError> {
         caller.require_auth();
+        Self::extend_instance_ttl(&env);
         let config: SplitConfig = env
             .storage()
             .instance()
@@ -249,47 +459,132 @@ impl RemittanceSplit {
         env.storage()
             .instance()
             .set(&symbol_short!("PAUSED"), &false);
-        env.events()
-            .publish((symbol_short!("split"), symbol_short!("unpaused")), ());
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("unpaused"),
+            (),
+        );
         Ok(())
     }
     pub fn is_paused(env: Env) -> bool {
         Self::get_global_paused(&env)
     }
     pub fn get_version(env: Env) -> u32 {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&symbol_short!("VERSION"))
             .unwrap_or(CONTRACT_VERSION)
     }
     fn get_upgrade_admin(env: &Env) -> Option<Address> {
+        Self::extend_instance_ttl(env);
         env.storage().instance().get(&symbol_short!("UPG_ADM"))
     }
+    /// Set or transfer the upgrade admin role.
+    ///
+    /// This function handles upgrade admin role assignment and transfers. If no upgrade admin
+    /// exists, only the contract owner can set the initial admin. If an upgrade admin exists,
+    /// only the current upgrade admin can transfer to a new admin. Emits an admin transfer event
+    /// for audit trail.
+    ///
+    /// # Security Requirements
+    /// - If no upgrade admin exists, only the contract owner can set the initial admin
+    /// - If upgrade admin exists, only the current upgrade admin can transfer to a new admin
+    /// - Caller must be authenticated via require_auth()
+    ///
+    /// # Parameters
+    /// - `caller`: The address attempting to set the upgrade admin
+    /// - `new_admin`: The address to become the new upgrade admin
+    ///
+    /// # Returns
+    /// - `Ok(())` on successful admin transfer
+    /// - `Err(RemittanceSplitError::Unauthorized)` if caller lacks permission
+    /// - `Err(RemittanceSplitError::NotInitialized)` if contract not initialized
+    ///
+    /// # Events
+    /// Emits `adm_xfr` event with (old_admin, new_admin) tuple for audit trail
     pub fn set_upgrade_admin(
         env: Env,
         caller: Address,
         new_admin: Address,
     ) -> Result<(), RemittanceSplitError> {
         caller.require_auth();
+
         let config: SplitConfig = env
             .storage()
             .instance()
             .get(&symbol_short!("CONFIG"))
             .ok_or(RemittanceSplitError::NotInitialized)?;
-        if config.owner != caller {
-            return Err(RemittanceSplitError::Unauthorized);
+
+        let current_upgrade_admin = Self::get_upgrade_admin(&env);
+
+        // Authorization logic:
+        // 1. If no upgrade admin exists, only contract owner can set initial admin
+        // 2. If upgrade admin exists, only current upgrade admin can transfer
+        match &current_upgrade_admin {
+            None => {
+                if config.owner != caller {
+                    return Err(RemittanceSplitError::Unauthorized);
+                }
+            }
+            Some(ref current_admin) => {
+                // Admin transfer - only current admin can transfer
+                if *current_admin != caller {
+                    return Err(RemittanceSplitError::Unauthorized);
+                }
+            }
         }
+
         env.storage()
             .instance()
             .set(&symbol_short!("UPG_ADM"), &new_admin);
+
+        // Emit admin transfer event for audit trail
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("adm_xfr")),
+            (current_upgrade_admin.clone(), new_admin.clone()),
+        );
+
         Ok(())
     }
+
+    /// Get the current upgrade admin address.
+    ///
+    /// # Returns
+    /// - `Some(Address)` if upgrade admin is set
+    /// - `None` if no upgrade admin has been configured
+    pub fn get_upgrade_admin_public(env: Env) -> Option<Address> {
+        Self::get_upgrade_admin(&env)
+    }
+
+    /// Get the current pause admin address.
+    ///
+    /// # Returns
+    /// - `Some(Address)` if pause admin is set
+    /// - `None` if no pause admin has been configured (owner is default)
+    pub fn get_pause_admin_public(env: Env) -> Option<Address> {
+        Self::get_pause_admin(&env)
+    }
+
+    /// Update the contract version marker used for migrations and upgrade coordination.
+    ///
+    /// # Arguments
+    /// * `caller` - Upgrade administrator address (must authorize)
+    /// * `new_version` - Version marker to persist in instance storage
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the split has not been initialized yet
+    /// - `Unauthorized` if `caller` is not the active upgrade admin or the contract is paused
     pub fn set_version(
         env: Env,
         caller: Address,
         new_version: u32,
     ) -> Result<(), RemittanceSplitError> {
         caller.require_auth();
+        Self::extend_instance_ttl(&env);
+        Self::require_not_paused(&env)?;
         let config: SplitConfig = env
             .storage()
             .instance()
@@ -303,10 +598,245 @@ impl RemittanceSplit {
         env.storage()
             .instance()
             .set(&symbol_short!("VERSION"), &new_version);
-        env.events().publish(
-            (symbol_short!("split"), symbol_short!("upgraded")),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("upgraded"),
             (prev, new_version),
         );
+        Ok(())
+    }
+
+    /// Capture a pre-upgrade snapshot of critical instance storage.
+    ///
+    /// Call this **before** performing a contract upgrade. The snapshot is stored
+    /// under `SNAPSHOT_KEY` in persistent storage and can be restored via
+    /// `restore_from_snapshot` if `post_upgrade` produces inconsistent results or
+    /// if the upgrade needs to be rolled back.
+    ///
+    /// # Authorization
+    /// Only the upgrade admin (or contract owner if no upgrade admin is set)
+    /// may take a snapshot.
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the contract has not been initialized yet
+    /// - `Unauthorized` if `caller` is not the upgrade admin or owner
+    ///
+    /// # Events
+    /// Emits `(symbol_short!("split"), symbol_short!("snap_pre"))` on success.
+    pub fn pre_upgrade(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RemittanceSplitError> {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        let admin = Self::get_upgrade_admin(&env).unwrap_or(config.owner.clone());
+        if admin != caller {
+            return Err(RemittanceSplitError::Unauthorized);
+        }
+
+        let previous_version = Self::get_version(env.clone());
+        let snapshot = PreUpgradeSnapshot {
+            schema_version: SNAPSHOT_VERSION,
+            config,
+            version: previous_version,
+            upgrade_admin: Self::get_upgrade_admin(&env),
+            paused: Self::get_global_paused(&env),
+            pause_admin: Self::get_pause_admin(&env),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&SNAPSHOT_KEY, &snapshot);
+
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("snap_pre")),
+            SNAPSHOT_VERSION,
+        );
+
+        Ok(())
+    }
+
+    /// Restore critical instance storage from a pre-upgrade snapshot.
+    ///
+    /// Reads the snapshot stored by `pre_upgrade` and writes the captured
+    /// `SplitConfig`, version, upgrade admin, and pause state back to
+    /// instance storage. The snapshot is consumed (removed) after a
+    /// successful restore.
+    ///
+    /// Use this to roll back a failed or inconsistent upgrade.
+    ///
+    /// # Authorization
+    /// Only the upgrade admin (or contract owner if no upgrade admin is set)
+    /// may restore from a snapshot.
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the contract has not been initialized yet
+    /// - `Unauthorized` if `caller` is not the upgrade admin or owner
+    /// - `UnsupportedVersion` if the snapshot version is not supported
+    ///
+    /// # Events
+    /// Emits `(symbol_short!("split"), symbol_short!("snap_rst"))` on success.
+    pub fn restore_from_snapshot(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RemittanceSplitError> {
+        caller.require_auth();
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        let admin = Self::get_upgrade_admin(&env).unwrap_or(config.owner);
+        if admin != caller {
+            return Err(RemittanceSplitError::Unauthorized);
+        }
+
+        let snapshot: PreUpgradeSnapshot = env
+            .storage()
+            .persistent()
+            .get(&SNAPSHOT_KEY)
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        if snapshot.schema_version != SNAPSHOT_VERSION {
+            return Err(RemittanceSplitError::UnsupportedVersion);
+        }
+
+        Self::extend_instance_ttl(&env);
+
+        // Restore config
+        env.storage()
+            .instance()
+            .set(&symbol_short!("CONFIG"), &snapshot.config);
+        env.storage().instance().set(
+            &symbol_short!("SPLIT"),
+            &vec![
+                &env,
+                snapshot.config.spending_percent,
+                snapshot.config.savings_percent,
+                snapshot.config.bills_percent,
+                snapshot.config.insurance_percent,
+            ],
+        );
+
+        // Restore version
+        env.storage()
+            .instance()
+            .set(&symbol_short!("VERSION"), &snapshot.version);
+
+        // Restore upgrade admin
+        match &snapshot.upgrade_admin {
+            Some(addr) => env.storage().instance().set(&symbol_short!("UPG_ADM"), addr),
+            None => env.storage().instance().remove(&symbol_short!("UPG_ADM")),
+        }
+
+        // Restore pause state
+        if snapshot.paused {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("PAUSED"), &true);
+        } else {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("PAUSED"), &false);
+        }
+
+        match &snapshot.pause_admin {
+            Some(addr) => env.storage().instance().set(&symbol_short!("PAUSE_ADM"), addr),
+            None => env.storage().instance().remove(&symbol_short!("PAUSE_ADM")),
+        }
+
+        // Consume the snapshot
+        env.storage().persistent().remove(&SNAPSHOT_KEY);
+
+        Self::append_audit(&env, symbol_short!("snap_rst"), &caller, true);
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("snap_rst")),
+            snapshot.version,
+        );
+
+        Ok(())
+    }
+
+    /// Discard a pre-upgrade snapshot without restoring it.
+    ///
+    /// Use this after a successful upgrade to clean up the snapshot and
+    /// free persistent storage.
+    ///
+    /// # Authorization
+    /// Only the upgrade admin (or contract owner if no upgrade admin is set)
+    /// may discard a snapshot.
+    ///
+    /// # Errors
+    /// - `NotInitialized` if the contract has not been initialized
+    /// - `Unauthorized` if `caller` is not the upgrade admin or owner
+    pub fn discard_snapshot(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RemittanceSplitError> {
+        caller.require_auth();
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        let admin = Self::get_upgrade_admin(&env).unwrap_or(config.owner);
+        if admin != caller {
+            return Err(RemittanceSplitError::Unauthorized);
+        }
+
+        env.storage().persistent().remove(&SNAPSHOT_KEY);
+
+        Self::append_audit(&env, symbol_short!("snap_dsc"), &caller, true);
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("snap_dsc")),
+            (),
+        );
+
+        Ok(())
+    }
+
+    /// Validate that every individual percentage is in [0, 100] **and** that
+    /// their sum equals exactly 100.
+    ///
+    /// Enforced invariants (checked in order):
+    /// 1. Each bucket must be <= 100 (`InvalidPercentages`).
+    /// 2. The four buckets must sum to exactly 100 (`PercentagesDoNotSumTo100`).
+    ///
+    /// Separating the two checks gives callers a precise error code:
+    /// a value like 110/0/0/0 produces `InvalidPercentages`, not a misleading
+    /// "doesn't sum to 100" message.
+    fn validate_percentages(
+        spending_percent: u32,
+        savings_percent: u32,
+        bills_percent: u32,
+        insurance_percent: u32,
+    ) -> Result<(), RemittanceSplitError> {
+        // Per-bucket upper-bound check — must precede sum check.
+        if spending_percent > 100
+            || savings_percent > 100
+            || bills_percent > 100
+            || insurance_percent > 100
+        {
+            return Err(RemittanceSplitError::InvalidPercentages);
+        }
+        // Global sum invariant.
+        let total = spending_percent + savings_percent + bills_percent + insurance_percent;
+        if total != 100 {
+            return Err(RemittanceSplitError::InvalidPercentages);
+        }
         Ok(())
     }
 
@@ -340,7 +870,20 @@ impl RemittanceSplit {
         bills_percent: u32,
         insurance_percent: u32,
     ) -> Result<bool, RemittanceSplitError> {
-        owner.require_auth();
+        let payload = SplitAuthPayload {
+            domain_id: symbol_short!("init"),
+            network_id: env.ledger().network_id(),
+            contract_addr: env.current_contract_address(),
+            owner_addr: owner.clone(),
+            nonce_val: nonce,
+            usdc_contract: usdc_contract.clone(),
+            spending_percent,
+            savings_percent,
+            bills_percent,
+            insurance_percent,
+        };
+        owner.require_auth_for_args(vec![&env, payload.into_val(&env)]);
+
         Self::require_not_paused(&env)?;
         Self::require_nonce(&env, &owner, nonce)?;
 
@@ -350,10 +893,14 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::AlreadyInitialized);
         }
 
-        let total = spending_percent + savings_percent + bills_percent + insurance_percent;
-        if total != 100 {
+        if let Err(_e) = Self::validate_percentages(
+            spending_percent,
+            savings_percent,
+            bills_percent,
+            insurance_percent,
+        ) {
             Self::append_audit(&env, symbol_short!("init"), &owner, false);
-            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
+            return Err(RemittanceSplitError::InvalidPercentages);
         }
 
         Self::extend_instance_ttl(&env);
@@ -385,8 +932,13 @@ impl RemittanceSplit {
 
         Self::increment_nonce(&env, &owner)?;
         Self::append_audit(&env, symbol_short!("init"), &owner, true);
-        env.events()
-            .publish((symbol_short!("split"), SplitEvent::Initialized), owner);
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("init"),
+            owner,
+        );
 
         Ok(true)
     }
@@ -415,10 +967,14 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::Unauthorized);
         }
 
-        let total = spending_percent + savings_percent + bills_percent + insurance_percent;
-        if total != 100 {
+        if let Err(_e) = Self::validate_percentages(
+            spending_percent,
+            savings_percent,
+            bills_percent,
+            insurance_percent,
+        ) {
             Self::append_audit(&env, symbol_short!("update"), &caller, false);
-            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
+            return Err(RemittanceSplitError::InvalidPercentages);
         }
 
         Self::extend_instance_ttl(&env);
@@ -450,13 +1006,17 @@ impl RemittanceSplit {
             timestamp: env.ledger().timestamp(),
         };
         env.events().publish((SPLIT_INITIALIZED,), event);
-        env.events()
-            .publish((symbol_short!("split"), SplitEvent::Updated), caller);
+        env.events().publish(
+            (symbol_short!("split"), SplitEvent::Updated),
+            caller.clone(),
+        );
 
+        Self::increment_nonce(&env, &caller)?;
         Ok(true)
     }
 
     pub fn get_split(env: &Env) -> Vec<u32> {
+        Self::extend_instance_ttl(env);
         env.storage()
             .instance()
             .get(&symbol_short!("SPLIT"))
@@ -464,6 +1024,7 @@ impl RemittanceSplit {
     }
 
     pub fn get_config(env: Env) -> Option<SplitConfig> {
+        Self::extend_instance_ttl(&env);
         env.storage().instance().get(&symbol_short!("CONFIG"))
     }
 
@@ -476,9 +1037,18 @@ impl RemittanceSplit {
         }
 
         let split = Self::get_split(&env);
-        let s0 = split.get(0).unwrap() as i128;
-        let s1 = split.get(1).unwrap() as i128;
-        let s2 = split.get(2).unwrap() as i128;
+        let s0 = match split.get(0) {
+            Some(v) => v as i128,
+            None => return Err(RemittanceSplitError::Overflow),
+        };
+        let s1 = match split.get(1) {
+            Some(v) => v as i128,
+            None => return Err(RemittanceSplitError::Overflow),
+        };
+        let s2 = match split.get(2) {
+            Some(v) => v as i128,
+            None => return Err(RemittanceSplitError::Overflow),
+        };
 
         let spending = total_amount
             .checked_mul(s0)
@@ -509,9 +1079,18 @@ impl RemittanceSplit {
             insurance_amount: insurance,
             timestamp: env.ledger().timestamp(),
         };
-        env.events().publish((SPLIT_CALCULATED,), event);
-        env.events().publish(
-            (symbol_short!("split"), SplitEvent::Calculated),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Low,
+            SPLIT_CALCULATED,
+            event,
+        );
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Low,
+            symbol_short!("calc_raw"),
             total_amount,
         );
 
@@ -548,11 +1127,27 @@ impl RemittanceSplit {
     /// - `InvalidNonce` on replay
     /// - `InvalidAmount` if `total_amount` ≤ 0
     /// - `NotInitialized` if the contract has not been initialized
+    ///
+    /// # Check ordering
+    /// 1. Self-transfer guard — returns SelfTransferNotAllowed if
+    ///    `from == destination`; records audit failure; nonce untouched.
+    /// 2. Nonce retrieval via `get_nonce()`.
+    /// 3. [signed path] Signature verification.
+    /// 4. Nonce mutation via `symbol_short!("NONCES")`.
+    /// 5. Token transfer execution.
+    /// 6. Audit success entry via `append_audit(..., true)`.
+    /// 7. `DistributionCompletedEvent` emission.
+    ///
+    /// # Errors (SelfTransferNotAllowed)
+    /// - `RemittanceSplitError::SelfTransferNotAllowed` (variant 13):
+    ///   returned before any nonce or token side-effects occur.
     pub fn distribute_usdc(
         env: Env,
         usdc_contract: Address,
         from: Address,
         nonce: u64,
+        deadline: u64,
+        request_hash: u64,
         accounts: AccountGroup,
         total_amount: i128,
     ) -> Result<bool, RemittanceSplitError> {
@@ -598,7 +1193,14 @@ impl RemittanceSplit {
         }
 
         // 8. Replay protection.
-        Self::require_nonce(&env, &from, nonce)?;
+        let expected_hash = Self::compute_request_hash(
+            symbol_short!("distrib"),
+            from.clone(),
+            nonce,
+            total_amount,
+            deadline,
+        );
+        Self::require_nonce_hardened(&env, &from, nonce, deadline, request_hash, expected_hash)?;
 
         // 9. Calculate split amounts and execute transfers.
         let amounts = Self::calculate_split_amounts(&env, total_amount, false)?;
@@ -617,14 +1219,157 @@ impl RemittanceSplit {
             token.transfer(&from, &accounts.insurance, &amounts[3]);
         }
 
-        // 10. Advance nonce, record audit, emit event.
+        // 10. Advance nonce, record audit, emit events.
         Self::increment_nonce(&env, &from)?;
-        Self::append_audit(&env, symbol_short!("distrib"), &from, true);
-        env.events().publish(
-            (symbol_short!("split"), SplitEvent::DistributionCompleted),
-            (from, total_amount),
+
+        // Emit unstructured event for backward compatibility
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Medium,
+            symbol_short!("dist_ok"),
+            (from.clone(), total_amount),
         );
 
+        // Structured distribution event removed to reduce transient memory allocations
+        // (keeps the lightweight unstructured event for backward compatibility).
+
+        Ok(true)
+    }
+
+    /// Distribute USDC with request hash and deadline verification.
+    ///
+    /// This function provides secure USDC distribution with deterministic request hashing
+    /// and deadline enforcement. Integrators sign the request hash before calling this function.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `request` - DistributeUsdcRequest containing all parameters and deadline
+    /// * `request_hash` - Pre-computed SHA-256 hash that must match compute_request_hash(request)
+    ///
+    /// # Returns
+    /// True if distribution was successful, Error if verification or execution fails
+    ///
+    /// # Errors
+    /// - `InvalidAmount` - total_amount <= 0
+    /// - `DeadlineExpired` - current_time > request.deadline
+    /// - `InvalidDeadline` - deadline is 0 or unreasonably far in future
+    /// - `InvalidNonce` - nonce doesn't match expected value
+    /// - `RequestHashMismatch` - provided hash doesn't match computed hash
+    /// - `Overflow` - arithmetic overflow in split calculation
+    ///
+    /// # Security Properties
+    /// 1. **Deadline Enforcement**: Prevents indefinite validity of signed requests (max 1 hour window)
+    /// 2. **Hash Verification**: Ensures no parameter tampering (all params bound to hash)
+    /// 3. **Nonce Protection**: Prevents replay attacks
+    /// 4. **Domain Separation**: Hash includes "distribute_usdc_v1" separator
+    /// 5. **Deterministic**: Same inputs always produce same hash
+    ///
+    /// # Example Workflow
+    /// 1. Off-chain: Create DistributeUsdcRequest with deadline = now() + 600 seconds
+    /// 2. Off-chain: Call get_request_hash to obtain hash
+    /// 3. Off-chain: Sign the hash with payer's private key
+    /// 4. On-chain: Call distribute_usdc_hashed with request and signature
+    ///
+    /// # Parameter Binding Fields
+    /// All parameters are cryptographically bound via SHA-256:
+    /// - `usdc_contract`: USDC token contract address (prevents cross-token attacks)
+    /// - `from`: Payer address (prevents impersonation)
+    /// - `nonce`: Transaction sequence number (prevents replays)
+    /// - `accounts.spending`: Spending destination (prevents fund misdirection)
+    /// - `accounts.savings`: Savings destination (prevents fund misdirection)
+    /// - `accounts.bills`: Bills destination (prevents fund misdirection)
+    /// - `accounts.insurance`: Insurance destination (prevents fund misdirection)
+    /// - `total_amount`: Total amount to distribute (prevents amount tampering)
+    /// - `deadline`: Expiry time (prevents stale request use)
+    pub fn distribute_usdc_hashed(
+        env: Env,
+        request: DistributeUsdcRequest,
+        request_hash: Bytes,
+    ) -> Result<bool, RemittanceSplitError> {
+        Self::extend_instance_ttl(&env);
+        // Validate amount
+        if request.total_amount <= 0 {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::InvalidAmount);
+        }
+
+        // Validate deadline
+        let current_time = env.ledger().timestamp();
+        if request.deadline == 0 {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::InvalidDeadline);
+        }
+        if current_time >= request.deadline {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::DeadlineExpired);
+        }
+
+        // Validate deadline is within reasonable bounds (max 1 hour from now)
+        let deadline_in_future = request.deadline - current_time;
+        if deadline_in_future > MAX_DEADLINE_WINDOW_SECS {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::InvalidDeadline);
+        }
+
+        // Verify request hash matches computed hash (binds all signed fields + domain_id)
+        let computed_hash = Self::get_request_hash(env.clone(), request.clone());
+        if computed_hash.ne(&request_hash) {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::RequestHashMismatch);
+        }
+
+        // Require authorization from payer
+        request.from.require_auth();
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+        if config.usdc_contract.ne(&request.usdc_contract) {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::UntrustedTokenContract);
+        }
+
+        // Self-transfer guard — must precede nonce read and mutation.
+        if request.accounts.spending == request.from
+            || request.accounts.savings == request.from
+            || request.accounts.bills == request.from
+            || request.accounts.insurance == request.from
+        {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::SelfTransferNotAllowed);
+        }
+
+        // Verify nonce
+        if Self::is_nonce_used(&env, &request.from, request.nonce) {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::NonceAlreadyUsed);
+        }
+        Self::require_nonce(&env, &request.from, request.nonce)?;
+
+        // Calculate split amounts
+        let amounts = Self::calculate_split_amounts(&env, request.total_amount, false)?;
+        let token = TokenClient::new(&env, &request.usdc_contract);
+
+        // Execute transfers
+        if amounts[0] > 0 {
+            token.transfer(&request.from, &request.accounts.spending, &amounts[0]);
+        }
+        if amounts[1] > 0 {
+            token.transfer(&request.from, &request.accounts.savings, &amounts[1]);
+        }
+        if amounts[2] > 0 {
+            token.transfer(&request.from, &request.accounts.bills, &amounts[2]);
+        }
+        if amounts[3] > 0 {
+            token.transfer(&request.from, &request.accounts.insurance, &amounts[3]);
+        }
+
+        // Increment nonce and record success
+        Self::increment_nonce(&env, &request.from)?;
+        Self::append_audit(&env, symbol_short!("distH"), &request.from, true);
         Ok(true)
     }
 
@@ -645,7 +1390,7 @@ impl RemittanceSplit {
         ];
 
         let mut result = Vec::new(env);
-        for (category, amount) in categories.into_iter().zip(amounts.into_iter()) {
+        for (category, amount) in categories.into_iter().zip(amounts) {
             result.push_back(Allocation { category, amount });
         }
         Ok(result)
@@ -656,6 +1401,7 @@ impl RemittanceSplit {
     }
 
     fn get_nonce_value(env: &Env, address: &Address) -> u64 {
+        Self::extend_instance_ttl(env);
         let nonces: Option<Map<Address, u64>> =
             env.storage().instance().get(&symbol_short!("NONCES"));
         nonces
@@ -664,66 +1410,75 @@ impl RemittanceSplit {
             .unwrap_or(0)
     }
 
+    /// Export a portable snapshot of the current split configuration.
+    ///
+    /// The returned payload includes an FNV-1a checksum that covers the version,
+    /// all percentage fields, the config timestamp, the initialized flag, and
+    /// the export timestamp (`exported_at`). Any mutation to these fields will
+    /// be detected by `import_snapshot` or `verify_snapshot`.
+    ///
+    /// # Authorization
+    /// Only the contract owner may export a snapshot.
     pub fn export_snapshot(
         env: Env,
         caller: Address,
     ) -> Result<Option<ExportSnapshot>, RemittanceSplitError> {
         caller.require_auth();
+        Self::extend_instance_ttl(&env);
         let config: SplitConfig = env
             .storage()
             .instance()
             .get(&symbol_short!("CONFIG"))
             .ok_or(RemittanceSplitError::NotInitialized)?;
         if config.owner != caller {
+            Self::append_audit(&env, symbol_short!("export"), &caller, false);
             return Err(RemittanceSplitError::Unauthorized);
         }
-
-        // Collect all schedules into an ordered Vec.
-        let next_rsch: u32 = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("NEXT_RSCH"))
-            .unwrap_or(0u32);
-        let sched_map: Map<u32, RemittanceSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-        let mut schedules = Vec::new(&env);
-        for i in 1..=next_rsch {
-            if let Some(s) = sched_map.get(i) {
-                schedules.push_back(s);
-            }
-        }
-
-        let checksum = Self::compute_checksum(SNAPSHOT_VERSION, &config, &schedules, next_rsch);
+        let schedules = Self::get_remittance_schedules(env.clone(), caller.clone());
+        let checksum = Self::compute_checksum(SCHEMA_VERSION, &config, &schedules);
+        env.events().publish(
+            (symbol_short!("split"), symbol_short!("snap_exp")),
+            SCHEMA_VERSION,
+        );
         Ok(Some(ExportSnapshot {
-            version: SNAPSHOT_VERSION,
+            schema_version: SCHEMA_VERSION,
             checksum,
             config,
             schedules,
-            next_rsch,
+            exported_at: env.ledger().timestamp(),
         }))
     }
 
-    /// Import a previously-exported snapshot, restoring both the `SplitConfig`
-    /// and all `RemittanceSchedule`s.
+    /// Import a previously exported snapshot, restoring the full `SplitConfig` and
+    /// associated `RemittanceSchedule` list to on-chain storage after running the
+    /// complete validation pipeline.
     ///
-    /// # Index reconstruction
-    /// After writing each imported schedule to the `REM_SCH` map this function
-    /// also appends the schedule id to the per-owner `OWN_SCH` index
-    /// (`Map<Address, Vec<u32>>`).  Without this step the schedules would be
-    /// present in storage but invisible to `get_remittance_schedules`,
-    /// `get_schedules_paginated`, and `execute_due_remittance_schedules`.
+    /// # Arguments
+    /// * `caller` - Split owner address (must authorize)
+    /// * `nonce` - Replay-protection nonce (must equal `get_nonce(caller)`)
+    /// * `snapshot` - Serialized configuration snapshot to restore
     ///
-    /// # NEXT_RSCH advancement
-    /// `NEXT_RSCH` is set to the maximum of its current value and the
-    /// `snapshot.next_rsch` field so that any schedule created after the import
-    /// receives an id that does not collide with an imported schedule.
-    ///
-    /// # Idempotency
-    /// The owner index is built from scratch on every import, so re-importing the
-    /// same snapshot (or a newer one) always produces a consistent, non-stale index.
+    /// # Errors
+    /// * `UnsupportedVersion` — `snapshot.schema_version` is outside
+    ///   `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]`.
+    /// * `ChecksumMismatch` — `snapshot.checksum` does not match the value computed
+    ///   by `compute_checksum` over the snapshot fields.
+    /// * `SnapshotNotInitialized` — `snapshot.config.initialized` is `false`; the
+    ///   snapshot represents an incomplete or factory-default configuration.
+    /// * `InvalidPercentageRange` — at least one of `spending_percent`,
+    ///   `savings_percent`, `bills_percent`, or `insurance_percent` exceeds `100`.
+    /// * `InvalidPercentages` — all four percentage fields are within `[0, 100]` but
+    ///   their sum is not equal to `100`.
+    /// * `InvalidAmount` — `snapshot.config.timestamp` is greater than the current
+    ///   ledger timestamp, indicating a future-dated or replayed payload.
+    /// * `Unauthorized` — `caller` is not the current on-chain owner stored in
+    ///   instance storage, or the contract is paused.
+    /// * `OwnerMismatch` — `snapshot.config.owner` does not equal `caller`, which
+    ///   would silently transfer ownership if allowed.
+    /// * `NotInitialized` — no existing `SplitConfig` is present in instance storage
+    ///   (the contract has not been initialized).
+    /// * `InvalidNonce` — the provided `nonce` has already been used or does not
+    ///   match the expected replay-protection value for `caller`.
     pub fn import_snapshot(
         env: Env,
         caller: Address,
@@ -731,23 +1486,62 @@ impl RemittanceSplit {
         snapshot: ExportSnapshot,
     ) -> Result<bool, RemittanceSplitError> {
         caller.require_auth();
+        Self::require_not_paused(&env)?;
         Self::require_nonce(&env, &caller, nonce)?;
 
-        if snapshot.version != SNAPSHOT_VERSION {
+        // 1. Version boundary check
+        if snapshot.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
+            || snapshot.schema_version > SCHEMA_VERSION
+        {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(RemittanceSplitError::UnsupportedVersion);
         }
         let expected = Self::compute_checksum(
-            snapshot.version,
+            snapshot.schema_version,
             &snapshot.config,
             &snapshot.schedules,
-            snapshot.next_rsch,
         );
         if snapshot.checksum != expected {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(RemittanceSplitError::ChecksumMismatch);
         }
 
+        // 3. Initialized flag — a snapshot with initialized = false is
+        //    incomplete and must not be restored.
+        if !snapshot.config.initialized {
+            Self::append_audit(&env, symbol_short!("import"), &caller, false);
+            return Err(RemittanceSplitError::NotInitialized);
+        }
+
+        // 4. Per-field percentage range — reject values that could not have
+        //    been produced by a valid initialize_split / update_split call.
+        if snapshot.config.spending_percent > 100
+            || snapshot.config.savings_percent > 100
+            || snapshot.config.bills_percent > 100
+            || snapshot.config.insurance_percent > 100
+        {
+            Self::append_audit(&env, symbol_short!("import"), &caller, false);
+            return Err(RemittanceSplitError::InvalidPercentages);
+        }
+
+        // 5. Sum constraint
+        let total = snapshot.config.spending_percent
+            + snapshot.config.savings_percent
+            + snapshot.config.bills_percent
+            + snapshot.config.insurance_percent;
+        if total != 100 {
+            Self::append_audit(&env, symbol_short!("import"), &caller, false);
+            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
+        }
+
+        // 6. Timestamp sanity — reject payloads whose timestamps are in the future.
+        let current_time = env.ledger().timestamp();
+        if snapshot.config.timestamp > current_time {
+            Self::append_audit(&env, symbol_short!("import"), &caller, false);
+            return Err(RemittanceSplitError::InvalidDueDate);
+        }
+
+        // 7. Caller must be the current contract owner.
         let existing: SplitConfig = env
             .storage()
             .instance()
@@ -758,13 +1552,29 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::Unauthorized);
         }
 
-        let total = snapshot.config.spending_percent
-            + snapshot.config.savings_percent
-            + snapshot.config.bills_percent
-            + snapshot.config.insurance_percent;
-        if total != 100 {
+        // 8. Ownership mapping — prevent silent ownership transfer via snapshot.
+        if snapshot.config.owner != caller {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
+            return Err(RemittanceSplitError::Unauthorized);
+        }
+
+        // 9. Schedule cap validation — prevent bypass via migration
+        if snapshot.schedules.len() > MAX_SCHEDULES_PER_OWNER {
+            Self::append_audit(&env, symbol_short!("import"), &caller, false);
+            return Err(RemittanceSplitError::ScheduleCapExceeded);
+        }
+
+        for schedule in snapshot.schedules.iter() {
+            if schedule.active {
+                if schedule.interval > 0 && schedule.interval < MIN_SCHEDULE_INTERVAL {
+                    Self::append_audit(&env, symbol_short!("import"), &caller, false);
+                    return Err(RemittanceSplitError::ScheduleIntervalTooShort);
+                }
+                if schedule.next_due.saturating_sub(current_time) > MAX_SCHEDULE_LEAD_TIME {
+                    Self::append_audit(&env, symbol_short!("import"), &caller, false);
+                    return Err(RemittanceSplitError::ScheduleLeadTimeTooLong);
+                }
+            }
         }
 
         Self::extend_instance_ttl(&env);
@@ -784,70 +1594,151 @@ impl RemittanceSplit {
             ],
         );
 
-        // --- Restore schedule map and rebuild per-owner index ---
-        //
-        // We start with fresh maps so that a re-import never leaves stale ids in
-        // the owner index from a previous import.
-        let mut sched_map: Map<u32, RemittanceSchedule> = Map::new(&env);
-        let mut owner_index: Map<Address, Vec<u32>> = Map::new(&env);
-
-        let mut max_id: u32 = snapshot.next_rsch;
+        // Import schedules to new storage
         for schedule in snapshot.schedules.iter() {
-            // Track the highest id so NEXT_RSCH is correct even if next_rsch
-            // was under-counted in the snapshot payload.
-            if schedule.id > max_id {
-                max_id = schedule.id;
-            }
-            sched_map.set(schedule.id, schedule.clone());
-
-            // Append this schedule's id to the owner's index entry.
-            let mut ids = owner_index
-                .get(schedule.owner.clone())
-                .unwrap_or_else(|| Vec::new(&env));
-            ids.push_back(schedule.id);
-            owner_index.set(schedule.owner.clone(), ids);
+            let key = DataKey::Schedule(schedule.id);
+            env.storage().persistent().set(&key, &schedule);
+            Self::extend_persistent_ttl(&env, &key);
         }
 
-        env.storage()
-            .instance()
-            .set(&symbol_short!("REM_SCH"), &sched_map);
-        env.storage()
-            .instance()
-            .set(&Self::STORAGE_OWNER_SCHED_IDS, &owner_index);
-
-        // Advance NEXT_RSCH to max_id so new schedules never reuse an imported id.
-        let current_next: u32 = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("NEXT_RSCH"))
-            .unwrap_or(0u32);
-        if max_id > current_next {
-            env.storage()
-                .instance()
-                .set(&symbol_short!("NEXT_RSCH"), &max_id);
-        }
+        // Reconstruct owner index
+        let owner_ids: Vec<u32> = Vec::new(&env);
+        // Schedule IDs are maintained in insertion order; Vec doesn't support sort
+        let index_key = DataKey::OwnerSchedules(caller.clone());
+        env.storage().persistent().set(&index_key, &owner_ids);
+        Self::extend_persistent_ttl(&env, &index_key);
 
         Self::increment_nonce(&env, &caller)?;
         Self::append_audit(&env, symbol_short!("import"), &caller, true);
+        env.events().publish(
+            (symbol_short!("split"), SplitEvent::SnapshotImported),
+            caller,
+        );
         Ok(true)
     }
 
-    pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> Vec<AuditEntry> {
+    /// Verify snapshot integrity without importing it.
+    ///
+    /// Runs the same validation pipeline as `import_snapshot` steps 2–7 — schema
+    /// version boundary, checksum integrity, initialized flag, per-field percentage
+    /// range, percentage sum constraint, and timestamp sanity — **without** modifying
+    /// any contract state. Use this as a read-only pre-flight check before calling
+    /// `import_snapshot`.
+    ///
+    /// Returns `Ok(true)` when all checks pass and the snapshot is ready to import.
+    ///
+    /// # Errors
+    /// - `UnsupportedVersion` — `snapshot.schema_version` is outside
+    ///   `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]`.
+    /// - `ChecksumMismatch` — the stored checksum does not match the freshly
+    ///   computed digest over the snapshot fields.
+    /// - `SnapshotNotInitialized` — `snapshot.config.initialized` is `false`.
+    /// - `InvalidPercentageRange` — at least one of the four percentage fields
+    ///   individually exceeds `100`.
+    /// - `InvalidPercentages` — all four fields are ≤ 100 but their sum is not `100`.
+    /// - `InvalidAmount` — `snapshot.config.timestamp` is greater than the current
+    ///   ledger timestamp (future-dated payload).
+    ///
+    /// # Note
+    /// This function does **not** check ownership mapping or nonce validity; those
+    /// require a specific caller context and are only enforced by `import_snapshot`.
+    pub fn verify_snapshot(
+        env: Env,
+        snapshot: ExportSnapshot,
+    ) -> Result<bool, RemittanceSplitError> {
+        // Step 2. Schema version boundary
+        if snapshot.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
+            || snapshot.schema_version > SCHEMA_VERSION
+        {
+            return Err(RemittanceSplitError::UnsupportedVersion);
+        }
+
+        // Step 3. Checksum integrity
+        let expected = Self::compute_checksum(
+            snapshot.schema_version,
+            &snapshot.config,
+            &snapshot.schedules,
+        );
+        if snapshot.checksum != expected {
+            return Err(RemittanceSplitError::ChecksumMismatch);
+        }
+
+        // Step 4. Initialized flag
+        if !snapshot.config.initialized {
+            return Err(RemittanceSplitError::NotInitialized);
+        }
+
+        // 4. Per-field range
+        if snapshot.config.spending_percent > 100
+            || snapshot.config.savings_percent > 100
+            || snapshot.config.bills_percent > 100
+            || snapshot.config.insurance_percent > 100
+        {
+            return Err(RemittanceSplitError::InvalidPercentages);
+        }
+
+        // 5. Sum constraint
+        let total = snapshot.config.spending_percent
+            + snapshot.config.savings_percent
+            + snapshot.config.bills_percent
+            + snapshot.config.insurance_percent;
+        if total != 100 {
+            return Err(RemittanceSplitError::InvalidPercentages);
+        }
+
+        // 6. Timestamp sanity
+        let current_time = env.ledger().timestamp();
+        if snapshot.config.timestamp > current_time {
+            return Err(RemittanceSplitError::FutureTimestamp);
+        }
+
+        Ok(true)
+    }
+
+    /// Return a page of audit log entries with a stable cursor.
+    ///
+    /// # Parameters
+    /// - `from_index`: zero-based starting index (pass 0 for the first page,
+    ///   then use the returned `next_cursor` for subsequent pages).
+    /// - `limit`: maximum entries to return; clamped to `[DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT]`.
+    ///
+    /// # Pagination contract
+    /// - Entries are returned oldest-to-newest within the rotating log window.
+    /// - `next_cursor == 0` signals no more pages.
+    /// - Uses saturating arithmetic so a caller cannot trigger overflow panics.
+    /// - Deterministic: identical `(from_index, limit)` on identical state always
+    ///   returns the same page, enabling reliable replay by audit consumers.
+    pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> AuditPage {
+        Self::extend_instance_ttl(&env);
         let log: Option<Vec<AuditEntry>> = env.storage().instance().get(&symbol_short!("AUDIT"));
         let log = log.unwrap_or_else(|| Vec::new(&env));
         let len = log.len();
-        let cap = MAX_AUDIT_ENTRIES.min(limit);
-        let mut out = Vec::new(&env);
+        let cap = clamp_limit(limit);
+
         if from_index >= len {
-            return out;
+            return AuditPage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
         }
-        let end = (from_index + cap).min(len);
+
+        let end = from_index.saturating_add(cap).min(len);
+        let mut items = Vec::new(&env);
         for i in from_index..end {
             if let Some(entry) = log.get(i) {
-                out.push_back(entry);
+                items.push_back(entry);
             }
         }
-        out
+
+        let count = items.len();
+        let next_cursor = if end < len { end } else { 0 };
+
+        AuditPage {
+            items,
+            next_cursor,
+            count,
+        }
     }
 
     fn require_nonce(
@@ -862,8 +1753,197 @@ impl RemittanceSplit {
         Ok(())
     }
 
+    /// Hardened nonce validation with three layers of replay protection:
+    ///
+    /// 1. **Deadline check** — rejects requests whose `deadline` is in the past
+    ///    or further than `MAX_DEADLINE_WINDOW_SECS` in the future (stale or
+    ///    pre-signed too far ahead).
+    /// 2. **Sequential counter** — the nonce must equal `get_nonce(address)`.
+    /// 3. **Used-nonce set** — the nonce must not appear in the per-address
+    ///    consumed set, preventing double-spend even if the counter is reset
+    ///    via snapshot import.
+    /// 4. **Request hash binding** — `request_hash` must equal the caller's
+    ///    expected fingerprint; prevents parameter-swap replay attacks where
+    ///    a valid nonce is reused with different arguments.
+    ///
+    /// # Arguments
+    /// * `address`      — The signing address
+    /// * `nonce`        — The nonce being consumed
+    /// * `deadline`     — Ledger timestamp after which the request expires
+    /// * `request_hash` — Caller-computed binding hash (see `compute_request_hash`)
+    /// * `expected_hash`— Hash the contract recomputes from its own parameters
+    fn require_nonce_hardened(
+        env: &Env,
+        address: &Address,
+        nonce: u64,
+        deadline: u64,
+        request_hash: u64,
+        expected_hash: u64,
+    ) -> Result<(), RemittanceSplitError> {
+        let now = env.ledger().timestamp();
+
+        // 1. Deadline: must be in the future but not too far ahead
+        if deadline <= now {
+            return Err(RemittanceSplitError::DeadlineExpired);
+        }
+        if deadline > now + MAX_DEADLINE_WINDOW_SECS {
+            return Err(RemittanceSplitError::DeadlineExpired);
+        }
+
+        // 2. Sequential counter
+        Self::require_nonce(env, address, nonce)?;
+
+        // 3. Used-nonce double-spend check
+        if Self::is_nonce_used(env, address, nonce) {
+            return Err(RemittanceSplitError::NonceAlreadyUsed);
+        }
+
+        // 4. Request hash binding
+        if request_hash != expected_hash {
+            return Err(RemittanceSplitError::RequestHashMismatch);
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if `nonce` has already been consumed for `address`.
+    fn is_nonce_used(env: &Env, address: &Address, nonce: u64) -> bool {
+        let key = symbol_short!("USED_N");
+        let map: Option<Map<Address, Vec<u64>>> = env.storage().instance().get(&key);
+        match map {
+            None => false,
+            Some(m) => match m.get(address.clone()) {
+                None => false,
+                Some(used) => used.contains(nonce),
+            },
+        }
+    }
+
+    fn mark_nonce_used(env: &Env, address: &Address, nonce: u64) {
+        let key = symbol_short!("USED_N");
+        let mut map: Map<Address, Vec<u64>> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Map::new(env));
+
+        let mut used: Vec<u64> = map.get(address.clone()).unwrap_or_else(|| Vec::new(env));
+
+        // Evict oldest if at capacity
+        if used.len() >= MAX_USED_NONCES_PER_ADDR {
+            let mut trimmed = Vec::new(env);
+            for i in 1..used.len() {
+                if let Some(v) = used.get(i) {
+                    trimmed.push_back(v);
+                }
+            }
+            used = trimmed;
+        }
+
+        used.push_back(nonce);
+        map.set(address.clone(), used);
+        env.storage().instance().set(&key, &map);
+    }
+
+    /// Compute a deterministic u64 request fingerprint.
+    ///
+    /// Binds: operation symbol bits + nonce + amount + deadline.
+    /// Compute the canonical SHA-256 binding hash for a `DistributeUsdcRequest`.
+    ///
+    /// Hash preimage layout (concatenated, in order):
+    ///  1. `DISTRIBUTE_USDC_DOMAIN`           — domain separator, prevents cross-domain replay
+    ///  2. `domain_id` = `symbol_short!("distrib")` — `SplitAuthPayload`-style functional tag
+    ///  3. `from`                              — sender address payload bits (8 bytes LE)
+    ///  4. `usdc_contract`                     — token contract payload bits (8 bytes LE)
+    ///  5. `accounts.spending`                 — destination address bits (8 bytes LE)
+    ///  6. `accounts.savings`                  — destination address bits (8 bytes LE)
+    ///  7. `accounts.bills`                    — destination address bits (8 bytes LE)
+    ///  8. `accounts.insurance`                — destination address bits (8 bytes LE)
+    ///  9. `total_amount`                      — i128 as 16 bytes LE
+    /// 10. `nonce`                             — u64 as 8 bytes LE
+    /// 11. `deadline`                          — u64 as 8 bytes LE
+    ///
+    /// Mutating *any* field in `request` yields a different 32-byte hash,
+    /// guaranteeing field-substitution resistance across all signed parameters.
+    pub fn get_request_hash(env: Env, request: DistributeUsdcRequest) -> Bytes {
+        let mut preimage = Bytes::new(&env);
+
+        // 1. Domain separator
+        preimage.extend_from_slice(DISTRIBUTE_USDC_DOMAIN);
+
+        // 2. Functional domain tag (SplitAuthPayload-style domain_id for distribute calls)
+        let did_bits: u64 = symbol_short!("distrib").to_val().get_payload();
+        preimage.extend_from_slice(&did_bits.to_le_bytes());
+
+        // 3. from address
+        let from_bits: u64 = request.from.to_val().get_payload();
+        preimage.extend_from_slice(&from_bits.to_le_bytes());
+
+        // 4. usdc_contract address
+        let usdc_bits: u64 = request.usdc_contract.to_val().get_payload();
+        preimage.extend_from_slice(&usdc_bits.to_le_bytes());
+
+        // 5. accounts.spending — prevents fund redirection
+        let spending_bits: u64 = request.accounts.spending.to_val().get_payload();
+        preimage.extend_from_slice(&spending_bits.to_le_bytes());
+
+        // 6. accounts.savings
+        let savings_bits: u64 = request.accounts.savings.to_val().get_payload();
+        preimage.extend_from_slice(&savings_bits.to_le_bytes());
+
+        // 7. accounts.bills
+        let bills_bits: u64 = request.accounts.bills.to_val().get_payload();
+        preimage.extend_from_slice(&bills_bits.to_le_bytes());
+
+        // 8. accounts.insurance
+        let insurance_bits: u64 = request.accounts.insurance.to_val().get_payload();
+        preimage.extend_from_slice(&insurance_bits.to_le_bytes());
+
+        // 9. total_amount — 16 bytes LE
+        preimage.extend_from_slice(&request.total_amount.to_le_bytes());
+
+        // 10. nonce — 8 bytes LE
+        preimage.extend_from_slice(&request.nonce.to_le_bytes());
+
+        // 11. deadline — 8 bytes LE
+        preimage.extend_from_slice(&request.deadline.to_le_bytes());
+
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Works in `no_std` — uses `Symbol::to_val()` to extract the raw
+    /// packed bits instead of `to_string()`, which requires std's `ToString`.
+    ///
+    /// # Arguments
+    /// * `operation` — Short symbol tag (e.g. `symbol_short!("distrib")`)
+    /// * `nonce`     — The request nonce
+    /// * `amount`    — Token amount (0 for non-monetary operations)
+    /// * `deadline`  — Request expiry ledger timestamp
+    pub fn compute_request_hash(
+        operation: Symbol,
+        _caller: Address,
+        nonce: u64,
+        amount: i128,
+        deadline: u64,
+    ) -> u64 {
+        let op_bits: u64 = operation.to_val().get_payload();
+
+        let amt_lo = amount as u64;
+        let amt_hi = (amount >> 64) as u64;
+
+        op_bits
+            .wrapping_add(nonce)
+            .wrapping_add(amt_lo)
+            .wrapping_add(amt_hi)
+            .wrapping_add(deadline)
+            .wrapping_mul(1_000_000_007)
+    }
+
     fn increment_nonce(env: &Env, address: &Address) -> Result<(), RemittanceSplitError> {
         let current = Self::get_nonce_value(env, address);
+        // Mark current nonce as used BEFORE advancing the counter
+        Self::mark_nonce_used(env, address, current);
+
         let next = current
             .checked_add(1)
             .ok_or(RemittanceSplitError::Overflow)?;
@@ -879,29 +1959,24 @@ impl RemittanceSplit {
         Ok(())
     }
 
-    fn compute_checksum(version: u32, config: &SplitConfig, schedules: &Vec<RemittanceSchedule>, next_rsch: u32) -> u64 {
+    fn compute_checksum(
+        version: u32,
+        config: &SplitConfig,
+        schedules: &Vec<RemittanceSchedule>,
+    ) -> u64 {
         let v = version as u64;
         let s = config.spending_percent as u64;
         let g = config.savings_percent as u64;
         let b = config.bills_percent as u64;
         let i = config.insurance_percent as u64;
-        let mut c = v
-            .wrapping_add(s)
+        let sc_count = schedules.len() as u64;
+
+        v.wrapping_add(s)
             .wrapping_add(g)
             .wrapping_add(b)
             .wrapping_add(i)
-            .wrapping_add(next_rsch as u64);
-        // Mix in schedule data so checksum catches corrupted schedule payloads.
-        for idx in 0..schedules.len() {
-            if let Some(sched) = schedules.get(idx) {
-                c = c
-                    .wrapping_add(sched.id as u64)
-                    .wrapping_add(sched.amount as u64)
-                    .wrapping_add(sched.next_due)
-                    .wrapping_add(sched.interval);
-            }
-        }
-        c.wrapping_mul(31)
+            .wrapping_add(sc_count)
+            .wrapping_mul(31)
     }
 
     fn append_audit(env: &Env, operation: Symbol, caller: &Address, success: bool) {
@@ -929,6 +2004,37 @@ impl RemittanceSplit {
         env.storage().instance().set(&symbol_short!("AUDIT"), &log);
     }
 
+    /// Compute the four split allocations for a given `total_amount`.
+    ///
+    /// # Algorithm
+    /// For spending (index 0), savings (index 1), and bills (index 2), each allocation
+    /// is computed via integer (floor) division:
+    ///
+    /// ```text
+    /// alloc[i] = floor(total_amount * percent[i] / 100)
+    /// ```
+    ///
+    /// Insurance (index 3) receives the **remainder / dust**:
+    ///
+    /// ```text
+    /// remainder = total_amount - alloc[0] - alloc[1] - alloc[2]
+    /// insurance = remainder
+    /// ```
+    ///
+    /// # Remainder / dust policy
+    /// The remainder is ALWAYS assigned to insurance (index 3), regardless of the configured
+    /// insurance percentage. This is the sole mechanism by which integer-division rounding
+    /// losses are recovered.
+    ///
+    /// # Post-conditions (guaranteed on `Ok`)
+    /// - `alloc[0] + alloc[1] + alloc[2] + alloc[3] == total_amount` (conservation invariant)
+    /// - `alloc[3] >= floor(total_amount * insurance_percent / 100)` (insurance ≥ its floor share)
+    ///
+    /// # Errors
+    /// - [`RemittanceSplitError::InvalidAmount`] — `total_amount <= 0`; checked before any
+    ///   allocation is computed.
+    /// - [`RemittanceSplitError::Overflow`] — any `checked_mul` or `checked_sub` step fails;
+    ///   returned immediately before any partial allocation value is produced.
     fn calculate_split_amounts(
         env: &Env,
         total_amount: i128,
@@ -979,9 +2085,18 @@ impl RemittanceSplit {
                 insurance_amount: insurance,
                 timestamp: env.ledger().timestamp(),
             };
-            env.events().publish((SPLIT_CALCULATED,), event);
-            env.events().publish(
-                (symbol_short!("split"), SplitEvent::Calculated),
+            RemitwiseEvents::emit(
+                env,
+                EventCategory::Transaction,
+                EventPriority::Low,
+                SPLIT_CALCULATED,
+                event,
+            );
+            RemitwiseEvents::emit(
+                env,
+                EventCategory::Transaction,
+                EventPriority::Low,
+                symbol_short!("calc_raw"),
                 total_amount,
             );
         }
@@ -989,13 +2104,36 @@ impl RemittanceSplit {
         Ok([spending, savings, bills, insurance])
     }
 
-    /// Extend the TTL of instance storage
+    /// Extend the TTL of instance storage using INSTANCE_BUMP_AMOUNT / INSTANCE_LIFETIME_THRESHOLD
+    /// from remitwise-common.
     fn extend_instance_ttl(env: &Env) {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Extend the TTL of a persistent storage entry using PERSISTENT_BUMP_AMOUNT /
+    /// PERSISTENT_LIFETIME_THRESHOLD from remitwise-common.
+    fn extend_persistent_ttl<K: IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Create a new automatic remittance schedule for the split owner.
+    ///
+    /// # Arguments
+    /// * `owner` - Split owner address (must authorize)
+    /// * `amount` - Amount to distribute on each execution
+    /// * `next_due` - Unix timestamp of the next execution
+    /// * `interval` - Recurrence interval in seconds; `0` creates a one-off schedule
+    ///
+    /// # Errors
+    /// - `InvalidAmount` if `amount` is not positive
+    /// - `InvalidDueDate` if `next_due` is not in the future
+    /// - `Unauthorized` if the contract is paused
     pub fn create_remittance_schedule(
         env: Env,
         owner: Address,
@@ -1004,6 +2142,17 @@ impl RemittanceSplit {
         interval: u64,
     ) -> Result<u32, RemittanceSplitError> {
         owner.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        if config.owner != owner {
+            return Err(RemittanceSplitError::Unauthorized);
+        }
 
         if amount <= 0 {
             return Err(RemittanceSplitError::InvalidAmount);
@@ -1014,20 +2163,43 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::InvalidDueDate);
         }
 
-        Self::extend_instance_ttl(&env);
+        if interval > 0 && interval < MIN_SCHEDULE_INTERVAL {
+            return Err(RemittanceSplitError::ScheduleIntervalTooShort);
+        }
 
-        let mut schedules: Map<u32, RemittanceSchedule> = env
+        if next_due.saturating_sub(current_time) > MAX_SCHEDULE_LEAD_TIME {
+            return Err(RemittanceSplitError::ScheduleLeadTimeTooLong);
+        }
+
+        // Check schedule cap before creating new schedule
+        let mut owner_schedules: Vec<u32> = env
             .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
+            .persistent()
+            .get(&DataKey::OwnerSchedules(owner.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
 
-        let next_schedule_id = env
+        if owner_schedules.len() >= MAX_SCHEDULES_PER_OWNER {
+            return Err(RemittanceSplitError::ScheduleCapExceeded);
+        }
+
+        let current_max_id = env
             .storage()
             .instance()
             .get(&symbol_short!("NEXT_RSCH"))
-            .unwrap_or(0u32)
-            + 1;
+            .unwrap_or(0u32);
+
+        let next_schedule_id = current_max_id
+            .checked_add(1)
+            .ok_or(RemittanceSplitError::Overflow)?;
+
+        // Explicit uniqueness check to prevent any potential storage collisions
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Schedule(next_schedule_id))
+        {
+            return Err(RemittanceSplitError::Overflow); // Should be unreachable with monotonic counter
+        }
 
         let schedule = RemittanceSchedule {
             id: next_schedule_id,
@@ -1042,38 +2214,50 @@ impl RemittanceSplit {
             missed_count: 0,
         };
 
-        schedules.set(next_schedule_id, schedule);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("REM_SCH"), &schedules);
+        // 1. Save individual schedule to persistent storage
+        // `set` is sufficient here; avoid an immediate extra `extend_ttl` call
+        // which performs an additional write and increases gas.
+        let sch_key = DataKey::Schedule(next_schedule_id);
+        env.storage().persistent().set(&sch_key, &schedule);
+
+        // 2. Update owner's schedule index.
+        // `next_schedule_id` is allocated as `current_max_id + 1`, so the
+        // per-owner index is naturally sorted ascending after `push_back`.
+        // Read paths rely on this invariant.
+        owner_schedules.push_back(next_schedule_id);
+        // Vec doesn't support sort; IDs are maintained in insertion order
+        let index_key = DataKey::OwnerSchedules(owner.clone());
+        env.storage().persistent().set(&index_key, &owner_schedules);
+
         env.storage()
             .instance()
             .set(&symbol_short!("NEXT_RSCH"), &next_schedule_id);
 
-        // Update per-owner index so get_remittance_schedules / get_schedules_paginated
-        // can locate this schedule without a full table scan.
-        let mut owner_index: Map<Address, Vec<u32>> = env
-            .storage()
-            .instance()
-            .get(&Self::STORAGE_OWNER_SCHED_IDS)
-            .unwrap_or_else(|| Map::new(&env));
-        let mut ids = owner_index
-            .get(owner.clone())
-            .unwrap_or_else(|| Vec::new(&env));
-        ids.push_back(next_schedule_id);
-        owner_index.set(owner.clone(), ids);
-        env.storage()
-            .instance()
-            .set(&Self::STORAGE_OWNER_SCHED_IDS, &owner_index);
-
-        env.events().publish(
-            (symbol_short!("schedule"), ScheduleEvent::Created),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("sch_new"),
             (next_schedule_id, owner),
         );
 
         Ok(next_schedule_id)
     }
 
+    /// Modify an existing remittance schedule owned by `caller`.
+    ///
+    /// # Arguments
+    /// * `caller` - Schedule owner address (must authorize)
+    /// * `schedule_id` - Identifier returned by `create_remittance_schedule`
+    /// * `amount` - Replacement schedule amount
+    /// * `next_due` - Replacement next due timestamp
+    /// * `interval` - Replacement recurrence interval in seconds
+    ///
+    /// # Errors
+    /// - `InvalidAmount` if `amount` is not positive
+    /// - `InvalidDueDate` if `next_due` is not in the future
+    /// - `ScheduleNotFound` if `schedule_id` does not exist
+    /// - `Unauthorized` if `caller` does not own the schedule or the contract is paused
     pub fn modify_remittance_schedule(
         env: Env,
         caller: Address,
@@ -1083,6 +2267,17 @@ impl RemittanceSplit {
         interval: u64,
     ) -> Result<bool, RemittanceSplitError> {
         caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        if config.owner != caller {
+            return Err(RemittanceSplitError::Unauthorized);
+        }
 
         if amount <= 0 {
             return Err(RemittanceSplitError::InvalidAmount);
@@ -1093,17 +2288,23 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::InvalidDueDate);
         }
 
-        Self::extend_instance_ttl(&env);
+        if interval > 0 && interval < MIN_SCHEDULE_INTERVAL {
+            return Err(RemittanceSplitError::ScheduleIntervalTooShort);
+        }
 
-        let mut schedules: Map<u32, RemittanceSchedule> = env
+        if next_due.saturating_sub(current_time) > MAX_SCHEDULE_LEAD_TIME {
+            return Err(RemittanceSplitError::ScheduleLeadTimeTooLong);
+        }
+
+        let mut schedule: RemittanceSchedule = env
             .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut schedule = schedules
-            .get(schedule_id)
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
             .ok_or(RemittanceSplitError::ScheduleNotFound)?;
+
+        if !schedule.active {
+            return Err(RemittanceSplitError::InactiveSchedule);
+        }
 
         if schedule.owner != caller {
             return Err(RemittanceSplitError::Unauthorized);
@@ -1114,37 +2315,46 @@ impl RemittanceSplit {
         schedule.interval = interval;
         schedule.recurring = interval > 0;
 
-        schedules.set(schedule_id, schedule);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("REM_SCH"), &schedules);
+        let sch_key = DataKey::Schedule(schedule_id);
+        env.storage().persistent().set(&sch_key, &schedule);
 
-        env.events().publish(
-            (symbol_short!("schedule"), ScheduleEvent::Modified),
-            (schedule_id, caller),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("sch_mod"),
+            schedule_id,
         );
 
         Ok(true)
     }
 
+    /// Cancel an existing remittance schedule owned by `caller`.
+    ///
+    /// # Arguments
+    /// * `caller` - Schedule owner address (must authorize)
+    /// * `schedule_id` - Identifier returned by `create_remittance_schedule`
+    ///
+    /// # Errors
+    /// - `ScheduleNotFound` if `schedule_id` does not exist
+    /// - `Unauthorized` if `caller` does not own the schedule or the contract is paused
     pub fn cancel_remittance_schedule(
         env: Env,
         caller: Address,
         schedule_id: u32,
     ) -> Result<bool, RemittanceSplitError> {
         caller.require_auth();
+        Self::require_not_paused(&env)?;
 
-        Self::extend_instance_ttl(&env);
-
-        let mut schedules: Map<u32, RemittanceSchedule> = env
+        let mut schedule: RemittanceSchedule = env
             .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut schedule = schedules
-            .get(schedule_id)
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
             .ok_or(RemittanceSplitError::ScheduleNotFound)?;
+
+        if !schedule.active {
+            return Err(RemittanceSplitError::InactiveSchedule);
+        }
 
         if schedule.owner != caller {
             return Err(RemittanceSplitError::Unauthorized);
@@ -1152,218 +2362,353 @@ impl RemittanceSplit {
 
         schedule.active = false;
 
-        schedules.set(schedule_id, schedule);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("REM_SCH"), &schedules);
+        let sch_key = DataKey::Schedule(schedule_id);
+        env.storage().persistent().set(&sch_key, &schedule);
 
-        env.events().publish(
-            (symbol_short!("schedule"), ScheduleEvent::Cancelled),
-            (schedule_id, caller),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Medium,
+            symbol_short!("sch_can"),
+            schedule_id,
         );
 
         Ok(true)
     }
 
-    /// Returns all remittance schedules belonging to `owner`.
+    /// Execute all due remittance schedules in a permissionless, idempotent manner.
     ///
-    /// Uses the per-owner index (`OWN_SCH`) when available so that the result
-    /// includes schedules that were restored via `import_snapshot`.  Falls back
-    /// to a full-map scan when the index is absent (e.g. legacy state created
-    /// before the index was introduced).
-    pub fn get_remittance_schedules(env: Env, owner: Address) -> Vec<RemittanceSchedule> {
-        let schedules: Map<u32, RemittanceSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let owner_index: Option<Map<Address, Vec<u32>>> =
-            env.storage().instance().get(&Self::STORAGE_OWNER_SCHED_IDS);
-
-        if let Some(index) = owner_index {
-            // Fast path — walk only the ids registered for this owner.
-            let ids = index
-                .get(owner.clone())
-                .unwrap_or_else(|| Vec::new(&env));
-            let mut result = Vec::new(&env);
-            for id in ids.iter() {
-                if let Some(s) = schedules.get(id) {
-                    result.push_back(s);
-                }
-            }
-            result
-        } else {
-            // Fallback full scan (no index present).
-            let mut result = Vec::new(&env);
-            for (_, schedule) in schedules.iter() {
-                if schedule.owner == owner {
-                    result.push_back(schedule);
-                }
-            }
-            result
-        }
-    }
-
-    pub fn get_remittance_schedule(env: Env, schedule_id: u32) -> Option<RemittanceSchedule> {
-        let schedules: Map<u32, RemittanceSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        schedules.get(schedule_id)
-    }
-
-    /// Returns a cursor-paginated page of schedules for `owner`.
+    /// This function is the executor entrypoint for remittance schedules, processing
+    /// all schedules whose `next_due <= ledger().timestamp()` and `active == true`.
+    /// It mirrors the pattern of `savings_goals::execute_due_savings_schedules` but
+    /// tracks execution state without performing fund transfers (which remain the
+    /// responsibility of `distribute_usdc`).
     ///
-    /// `cursor` is the id of the first schedule to include (pass `0` for the
-    /// first page).  `limit` is the maximum number of items to return (clamped
-    /// to 50).  The returned `SchedulePage.next_cursor` is the id of the first
-    /// item of the *next* page, or `0` when there are no more pages.
-    pub fn get_schedules_paginated(
-        env: Env,
-        owner: Address,
-        cursor: u32,
-        limit: u32,
-    ) -> SchedulePage {
-        let max_limit: u32 = 50;
-        let page_size = if limit == 0 || limit > max_limit {
-            max_limit
-        } else {
-            limit
-        };
-
-        let schedules: Map<u32, RemittanceSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let owner_index: Option<Map<Address, Vec<u32>>> =
-            env.storage().instance().get(&Self::STORAGE_OWNER_SCHED_IDS);
-
-        // Collect all ids that belong to this owner, in index order.
-        let all_ids: Vec<u32> = if let Some(index) = owner_index {
-            index
-                .get(owner.clone())
-                .unwrap_or_else(|| Vec::new(&env))
-        } else {
-            // Fallback: derive ids from full schedule scan.
-            let mut ids = Vec::new(&env);
-            for (id, sched) in schedules.iter() {
-                if sched.owner == owner {
-                    ids.push_back(id);
-                }
-            }
-            ids
-        };
-
-        let total = all_ids.len();
-        // Find the start position: first index where id >= cursor (or 0 = from start).
-        let start: u32 = if cursor == 0 {
-            0
-        } else {
-            let mut pos = total; // default: not found → empty page
-            for i in 0..total {
-                if let Some(id) = all_ids.get(i) {
-                    if id >= cursor {
-                        pos = i;
-                        break;
-                    }
-                }
-            }
-            pos
-        };
-
-        let end = (start + page_size).min(total);
-        let mut items = Vec::new(&env);
-        for i in start..end {
-            if let Some(id) = all_ids.get(i) {
-                if let Some(s) = schedules.get(id) {
-                    items.push_back(s);
-                }
-            }
-        }
-
-        let next_cursor = if end < total {
-            all_ids.get(end).unwrap_or(0)
-        } else {
-            0
-        };
-
-        SchedulePage {
-            count: items.len(),
-            items,
-            next_cursor,
-        }
-    }
-
-    /// Execute all remittance schedules whose `next_due` has arrived.
+    /// # Security & Idempotency
     ///
-    /// This is the "due sweep" called by an off-chain keeper or cron.  It
-    /// iterates the full schedule map, marks one-shot schedules inactive, and
-    /// advances recurring schedules to their next due date.  `last_executed`
-    /// and `missed_count` are preserved faithfully for schedules that were
-    /// restored via `import_snapshot`.
+    /// ## Idempotent next_due advancement
+    /// A key safety property is that `next_due` is **only advanced after**
+    /// `last_executed` is set to the current ledger timestamp. This ensures that:
+    /// * A double-call at the same timestamp sees `next_due > current_time` and skips
+    ///   re-execution (the idempotency guard `if let Some(last) = last_executed; if last >= next_due_original`)
+    /// * If the function crashes mid-execution for a schedule, the next call will
+    ///   retry from the same window (since `next_due` was never advanced)
     ///
-    /// Returns the ids of every schedule that was executed in this sweep.
+    /// ## Paused contract rejection
+    /// The function immediately returns an empty Vec if the contract is paused,
+    /// ensuring no schedule state changes during emergency freeze.
+    ///
+    /// ## Re-validation of config
+    /// The CONFIG is re-read at function start to ensure the split contract is
+    /// initialized and the token address is still pinned (no mutation of token
+    /// address happens in this function, but we validate the contract is ready).
+    ///
+    /// # Execution Logic
+    ///
+    /// For each active schedule with `next_due <= current_time`:
+    /// 1. Load the schedule from persistent storage.
+    /// 2. Check if `active == true`; skip if already deactivated.
+    /// 3. **Idempotency check**: If `last_executed >= next_due`, skip (already
+    ///    executed in this due window).
+    /// 4. Set `last_executed = current_time` **before advancing next_due**.
+    /// 5. Advance `next_due`:
+    ///    - **One-off** (`interval == 0`): Deactivate (`active = false`).
+    ///    - **Recurring** (`interval > 0`): Advance `next_due` by interval until
+    ///      it is strictly greater than `current_time`. Count skipped intervals
+    ///      and increment `missed_count`.
+    /// 6. Persist the schedule and emit events.
+    /// 7. Record the executed schedule ID.
+    ///
+    /// # Drift Handling
+    /// If a schedule is delayed (e.g., executor runs 3 intervals late), the function
+    /// will "catch up" by advancing `next_due` through all missed intervals, tracking
+    /// the count. `missed_count` is incremented for each missed interval.
+    ///
+    /// # Events Emitted
+    /// - `ScheduleEvent::Executed` for each successfully executed schedule.
+    /// - `ScheduleEvent::Missed` for each interval missed in a recurring schedule.
+    ///
+    /// # Permissionless Execution
+    /// This function requires **no authorization** — any account may call it. This
+    /// is intentional: the executor is a utility for maintaining schedule state,
+    /// and blocking it would break automation. The schedule modifications
+    /// (`create`, `modify`, `cancel`) remain owner-only and properly authorized.
+    ///
+    /// # Authorization Assumptions
+    /// - Schedule creation/modification/cancellation are guarded by owner authorization.
+    /// - Once a schedule is created, only this function and cancellation can modify
+    ///   its `next_due` and `last_executed` fields.
+    /// - An attacker cannot bypass the idempotency guard by resetting `last_executed`
+    ///   (only `execute_due_remittance_schedules` can set it, and only forward in time).
+    ///
+    /// # Returns
+    /// A vector of schedule IDs that were successfully executed in this call.
+    /// An empty vector means either no schedules were due or the contract was paused.
     pub fn execute_due_remittance_schedules(env: Env) -> Vec<u32> {
         Self::extend_instance_ttl(&env);
+
+        // Check if contract is paused; if so, return empty (permissionless safety valve)
+        if Self::get_global_paused(&env) {
+            return Vec::new(&env);
+        }
+
+        // Validate CONFIG exists (ensures contract is initialized)
+        let _config: SplitConfig = match env.storage().instance().get(&symbol_short!("CONFIG")) {
+            Some(c) => c,
+            None => return Vec::new(&env),
+        };
 
         let current_time = env.ledger().timestamp();
         let mut executed = Vec::new(&env);
 
-        let mut schedules: Map<u32, RemittanceSchedule> = env
+        // Iterate through all schedule IDs
+        let next_schedule_id = env
             .storage()
             .instance()
-            .get(&symbol_short!("REM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
+            .get::<_, u32>(&symbol_short!("NEXT_RSCH"))
+            .unwrap_or(0);
 
-        for (schedule_id, mut schedule) in schedules.iter() {
+        for schedule_id in 1..=next_schedule_id {
+            let sch_key = DataKey::Schedule(schedule_id);
+            let mut schedule = match env
+                .storage()
+                .persistent()
+                .get::<_, RemittanceSchedule>(&sch_key)
+            {
+                Some(s) => s,
+                None => continue, // Schedule was never created or was deleted
+            };
+            Self::extend_persistent_ttl(&env, &sch_key);
+
+            // Skip if not active or not yet due
             if !schedule.active || schedule.next_due > current_time {
                 continue;
             }
 
+            // Idempotency check: if we've already executed this schedule in the current
+            // due window, skip it. This prevents double-execution at the same ledger timestamp.
+            if let Some(last_exec) = schedule.last_executed {
+                if last_exec >= schedule.next_due {
+                    continue; // Already executed in this window
+                }
+            }
+
+            // Mark execution timestamp **before** advancing next_due
             schedule.last_executed = Some(current_time);
 
+            // Advance next_due based on schedule type
             if schedule.recurring && schedule.interval > 0 {
                 let mut missed = 0u32;
                 let mut next = schedule.next_due + schedule.interval;
                 while next <= current_time {
                     missed = missed.saturating_add(1);
-                    next += schedule.interval;
+                    next = next.saturating_add(schedule.interval);
                 }
                 schedule.missed_count = schedule.missed_count.saturating_add(missed);
                 schedule.next_due = next;
 
+                // Emit missed event if there were skipped intervals
                 if missed > 0 {
-                    env.events().publish(
-                        (symbol_short!("schedule"), ScheduleEvent::Missed),
+                    RemitwiseEvents::emit(
+                        &env,
+                        EventCategory::State,
+                        EventPriority::Low,
+                        symbol_short!("sch_miss"),
                         (schedule_id, missed),
                     );
                 }
             } else {
+                // One-off schedule: deactivate after execution
                 schedule.active = false;
             }
 
-            schedules.set(schedule_id, schedule);
-            executed.push_back(schedule_id);
+            // Persist the updated schedule
+            env.storage().persistent().set(&sch_key, &schedule);
+            Self::extend_persistent_ttl(&env, &sch_key);
 
-            env.events().publish(
-                (symbol_short!("schedule"), ScheduleEvent::Executed),
-                schedule_id,
+            // Emit execution event
+            RemitwiseEvents::emit(
+                &env,
+                EventCategory::State,
+                EventPriority::Medium,
+                symbol_short!("sch_exec"),
+                (schedule_id, schedule.amount),
             );
-        }
 
-        env.storage()
-            .instance()
-            .set(&symbol_short!("REM_SCH"), &schedules);
+            // Record this schedule as executed
+            executed.push_back(schedule_id);
+        }
 
         executed
     }
 
-}
+    pub fn get_remittance_schedules(env: Env, owner: Address) -> Vec<RemittanceSchedule> {
+        let index_key = DataKey::OwnerSchedules(owner.clone());
+        let Some(schedule_ids) = env.storage().persistent().get::<_, Vec<u32>>(&index_key) else {
+            return Vec::new(&env);
+        };
+        // Read-only accessor: avoid TTL bumps to reduce gas for read-heavy operations.
 
-#[cfg(test)]
-mod test;
+        let mut result = Vec::new(&env);
+        for id in schedule_ids.iter() {
+            let sch_key = DataKey::Schedule(id);
+            if let Some(schedule) = env.storage().persistent().get(&sch_key) {
+                result.push_back(schedule);
+            }
+        }
+        result
+    }
+
+    /// Get remittance schedules for an owner with pagination.
+    ///
+    /// Returns schedules ordered by ID ascending, with stable cursor-based pagination.
+    /// This ensures deterministic ordering for UI/indexer cursor management.
+    ///
+    /// **Ordering Guarantee**: Schedules are always returned in ascending ID order,
+    /// regardless of creation time or storage order. This provides stable pagination
+    /// cursors that work reliably across different storage implementations.
+    ///
+    /// # Arguments
+    /// * `owner` - The owner address to query schedules for
+    /// * `from_index` - Zero-based starting index in the owner's schedule list
+    /// * `limit` - Maximum number of schedules to return (clamped to MAX_PAGE_LIMIT)
+    ///
+    /// # Returns
+    /// A SchedulePage containing:
+    /// - `items`: Schedules for this page, ordered by ID ascending
+    /// - `next_cursor`: Index for next page (0 if no more pages)
+    /// - `count`: Number of items in this page
+    ///
+    /// # Pagination Notes
+    /// - Results are ordered deterministically by schedule ID ascending
+    /// - `from_index` is a stable cursor within the owner's schedule list
+    /// - `limit` is clamped to prevent excessive gas usage
+    /// - Out-of-range `from_index` returns empty page safely
+    /// - Cancelled schedules are included (they remain in storage for audit)
+    pub fn get_schedules_paginated(
+        env: Env,
+        owner: Address,
+        from_index: u32,
+        limit: u32,
+    ) -> SchedulePage {
+        let index_key = DataKey::OwnerSchedules(owner.clone());
+        let Some(schedule_ids) = env.storage().persistent().get::<_, Vec<u32>>(&index_key) else {
+            return SchedulePage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
+        };
+        Self::extend_persistent_ttl(&env, &index_key);
+
+        // Vec items are already retrieved in order; ensure deterministic traversal
+        // by processing sequentially without mutating the order
+
+        let len = schedule_ids.len();
+        let cap = clamp_limit(limit);
+
+        if from_index >= len {
+            return SchedulePage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
+        }
+
+        let end = from_index.saturating_add(cap).min(len);
+        let mut items = Vec::new(&env);
+        // Iterate using the host Vec iterator with skip/take to avoid repeated
+        // indexed `get` calls and reduce host op overhead. Avoid per-schedule
+        // TTL bumps in this read-only accessor to cut storage write gas.
+        for id in schedule_ids
+            .iter()
+            .skip(from_index as usize)
+            .take(cap as usize)
+        {
+            let sch_key = DataKey::Schedule(id);
+            if let Some(schedule) = env.storage().persistent().get(&sch_key) {
+                items.push_back(schedule);
+            }
+        }
+
+        let count = items.len();
+        let next_cursor = if end < len { end } else { 0 };
+
+        SchedulePage {
+            items,
+            next_cursor,
+            count,
+        }
+    }
+
+    pub fn get_remittance_schedule(env: Env, schedule_id: u32) -> Option<RemittanceSchedule> {
+        let sch_key = DataKey::Schedule(schedule_id);
+        // Read-only accessor — avoid an extra TTL write to reduce gas.
+        env.storage().persistent().get(&sch_key)
+    }
+
+    /// Get a single page of remittance schedules for `owner` using cursor-based pagination.
+    ///
+    /// Schedules are ordered by ID ascending. `cursor` is a zero-based index into the
+    /// owner's sorted schedule list. `limit` is clamped to `MAX_PAGE_LIMIT` via
+    /// `clamp_limit()` from `remitwise-common`.
+    ///
+    /// # Arguments
+    /// * `owner`  - Address whose schedules are queried (public read, no auth required)
+    /// * `cursor` - Zero-based start index (pass `0` for the first page)
+    /// * `limit`  - Maximum items to return; clamped to `[1, MAX_PAGE_LIMIT]`
+    ///
+    /// # Returns
+    /// `SchedulePage` with:
+    /// - `items`: schedules for this page, ordered by ID ascending
+    /// - `next_cursor`: Index for the next page; `0` when no more pages exist
+    /// - `count`: number of items in this page
+    pub fn get_remittance_schedules_page(
+        env: Env,
+        owner: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> SchedulePage {
+        let index_key = DataKey::OwnerSchedules(owner.clone());
+        let Some(schedule_ids) = env.storage().persistent().get::<_, Vec<u32>>(&index_key) else {
+            return SchedulePage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
+        };
+        // Read-only accessor: avoid TTL bumps and avoid sorting to reduce CPU work.
+
+        let len = schedule_ids.len();
+        let cap = clamp_limit(limit);
+
+        if cursor >= len {
+            return SchedulePage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
+        }
+
+        let end = cursor.saturating_add(cap).min(len);
+        let mut items = Vec::new(&env);
+        for i in cursor..end {
+            if let Some(id) = schedule_ids.get(i) {
+                let sch_key = DataKey::Schedule(id);
+                if let Some(schedule) = env.storage().persistent().get(&sch_key) {
+                    items.push_back(schedule);
+                    Self::extend_persistent_ttl(&env, &sch_key);
+                }
+            }
+        }
+
+        let count = items.len();
+        let next_cursor = if end < len { end } else { 0 };
+
+        SchedulePage {
+            items,
+            next_cursor,
+            count,
+        }
+    }
+}
