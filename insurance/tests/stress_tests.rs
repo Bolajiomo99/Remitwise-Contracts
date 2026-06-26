@@ -18,6 +18,7 @@
 //!   MAX_BATCH_SIZE              = 50
 
 use insurance::{Insurance, InsuranceClient};
+use remitwise_common::CoverageType;
 use soroban_sdk::testutils::storage::Instance as _;
 use soroban_sdk::testutils::{Address as AddressTrait, EnvTestConfig, Ledger, LedgerInfo};
 use soroban_sdk::{Address, Env, String};
@@ -71,19 +72,20 @@ fn stress_200_policies_single_user() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "StressPolicy");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     for _ in 0..200 {
-        client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+        client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
     }
 
     // Verify aggregate monthly premium
     let total_premium = client.get_total_monthly_premium(&owner);
     assert_eq!(
         total_premium,
-        200 * 100i128,
+        200 * 5_000_000i128,
         "get_total_monthly_premium must sum premiums across all 200 policies"
     );
 
@@ -121,12 +123,13 @@ fn stress_instance_ttl_valid_after_200_policies() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "TTLPolicy");
-    let coverage_type = String::from_str(&env, "life");
+    let coverage_type = CoverageType::Life;
 
     for _ in 0..200 {
-        client.create_policy(&owner, &name, &coverage_type, &50i128, &5_000i128);
+        client.create_policy(&owner, &name, &coverage_type, &1_000_000i128, &60_000_000i128);
     }
 
     let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -151,11 +154,12 @@ fn stress_policies_across_10_users() {
 
     const N_USERS: usize = 10;
     const POLICIES_PER_USER: u32 = 20;
-    const PREMIUM_PER_POLICY: i128 = 150;
+    const PREMIUM_PER_POLICY: i128 = 5_000_000;
     let name = String::from_str(&env, "UserPolicy");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     let users: std::vec::Vec<Address> = (0..N_USERS).map(|_| Address::generate(&env)).collect();
+    client.init(&users[0]);
 
     for user in &users {
         for _ in 0..POLICIES_PER_USER {
@@ -164,7 +168,7 @@ fn stress_policies_across_10_users() {
                 &name,
                 &coverage_type,
                 &PREMIUM_PER_POLICY,
-                &50_000i128,
+                &50_000_000i128,
             );
         }
     }
@@ -212,13 +216,14 @@ fn stress_ttl_re_bumped_after_ledger_advancement() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "TTLStress");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     // Phase 1: 50 creates
     for _ in 0..50 {
-        client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+        client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
     }
 
     let ttl_batch1 = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -249,7 +254,7 @@ fn stress_ttl_re_bumped_after_ledger_advancement() {
     );
 
     // Phase 3: create_policy fires extend_ttl → re-bumped
-    client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+    client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
 
     let ttl_rebumped = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
     assert!(
@@ -267,12 +272,13 @@ fn stress_ttl_re_bumped_by_pay_premium_after_ledger_advancement() {
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
 
+    client.init(&owner);
     let policy_id = client.create_policy(
         &owner,
         &String::from_str(&env, "PayTTL"),
-        &String::from_str(&env, "health"),
-        &200i128,
-        &20_000i128,
+        &CoverageType::Health,
+        &5_000_000i128,
+        &50_000_000i128,
     );
 
     // Advance ledger so TTL drops below threshold
@@ -311,14 +317,15 @@ fn stress_batch_pay_premiums_at_max_batch_size() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     const BATCH_SIZE: u32 = 50; // MAX_BATCH_SIZE
     let name = String::from_str(&env, "BatchPolicy");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     let mut policy_ids = std::vec![];
     for _ in 0..BATCH_SIZE {
-        let id = client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+        let id = client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
         policy_ids.push(id);
     }
 
@@ -341,7 +348,7 @@ fn stress_batch_pay_premiums_at_max_batch_size() {
     // the value is a valid future date.
     let expected_next = 1_700_000_000u64 + (30 * 86400);
     for &id in &policy_ids {
-        let policy = client.get_policy(&id).unwrap();
+        let policy = client.get_policy(&id);
         assert!(
             policy.active,
             "Policy {} must still be active after batch premium payment",
@@ -363,12 +370,13 @@ fn stress_deactivate_half_of_200_policies() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "DeactPolicy");
-    let coverage_type = String::from_str(&env, "life");
+    let coverage_type = CoverageType::Life;
 
     for _ in 0..200 {
-        client.create_policy(&owner, &name, &coverage_type, &80i128, &8_000i128);
+        client.create_policy(&owner, &name, &coverage_type, &1_000_000i128, &60_000_000i128);
     }
 
     // Deactivate even-numbered policies (IDs 2, 4, 6, …, 200)
@@ -393,11 +401,11 @@ fn stress_deactivate_half_of_200_policies() {
         "After deactivating 100 of 200 policies, only 100 must be returned by get_active_policies"
     );
 
-    // Verify monthly premium dropped by exactly half: 100 deactivated × 80 = 8000 less
+    // Verify monthly premium dropped by exactly half: 100 deactivated × 1_000_000 = 100_000_000 less
     let remaining_premium = client.get_total_monthly_premium(&owner);
     assert_eq!(
         remaining_premium,
-        100 * 80i128,
+        100 * 1_000_000i128,
         "Monthly premium must reflect only the 100 still-active policies"
     );
 }
@@ -413,12 +421,13 @@ fn bench_get_active_policies_first_page_of_200() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "BenchPolicy");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     for _ in 0..200 {
-        client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+        client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
     }
 
     let (cpu, mem, page) = measure(&env, || client.get_active_policies(&owner, &0u32, &50u32));
@@ -437,15 +446,16 @@ fn bench_get_total_monthly_premium_200_policies() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "PremBench");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     for _ in 0..200 {
-        client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+        client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
     }
 
-    let expected = 200i128 * 100;
+    let expected = 200i128 * 5_000_000;
     let (cpu, mem, total) = measure(&env, || client.get_total_monthly_premium(&owner));
     assert_eq!(total, expected);
 
@@ -462,13 +472,14 @@ fn bench_batch_pay_premiums_50_policies() {
     let contract_id = env.register_contract(None, Insurance);
     let client = InsuranceClient::new(&env, &contract_id);
     let owner = Address::generate(&env);
+    client.init(&owner);
 
     let name = String::from_str(&env, "BatchBench");
-    let coverage_type = String::from_str(&env, "health");
+    let coverage_type = CoverageType::Health;
 
     let mut policy_ids = std::vec![];
     for _ in 0..50 {
-        let id = client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128);
+        let id = client.create_policy(&owner, &name, &coverage_type, &5_000_000i128, &50_000_000i128);
         policy_ids.push(id);
     }
 
