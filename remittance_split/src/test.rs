@@ -2031,10 +2031,7 @@ fn assert_canonical_order(_env: &Env, allocs: &soroban_sdk::Vec<Allocation>) {
 
 /// Helper: assert sum of allocation amounts equals `total`.
 fn assert_conservation(allocs: &soroban_sdk::Vec<Allocation>, total: i128) {
-    let sum: i128 = allocs
-        .iter()
-        .map(|a| a.amount)
-        .sum();
+    let sum: i128 = allocs.iter().map(|a| a.amount).sum();
     assert_eq!(sum, total, "allocation amounts must sum to total_amount");
 }
 
