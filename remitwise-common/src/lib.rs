@@ -114,11 +114,96 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// Maximum batch size for operations
 pub const MAX_BATCH_SIZE: u32 = 50;
 
-/// Pre-upgrade snapshot version
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// Rate limiting constants
+pub const RATE_LIMIT_WINDOW_SECONDS: u64 = 86400; // 24 hours
+const STORAGE_RATE_LIMIT: Symbol = symbol_short!("RATE_LIM");
 
-/// Storage key for pre-upgrade snapshots
-pub const SNAPSHOT_KEY: Symbol = symbol_short!("SNAPSHOT");
+/// Rate limit record: stores count per address + operation + window
+#[contracttype]
+#[derive(Clone)]
+pub struct RateLimitRecord {
+    pub count: u32,
+    pub window_id: u64,
+}
+
+/// Rate limit error
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateLimitError {
+    RateLimitExceeded,
+}
+
+/// Helper to check and increment rate limit
+/// 
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `caller` - Address of the caller
+/// * `operation` - Symbol identifying the operation to rate limit
+/// * `limit` - Maximum allowed operations per window
+/// 
+/// # Returns
+/// * `Ok(())` if within limit
+/// * `Err(RateLimitError::RateLimitExceeded)` if limit exceeded
+pub fn check_and_increment_rate_limit(
+    env: &Env,
+    caller: &Address,
+    operation: Symbol,
+    limit: u32,
+) -> Result<(), RateLimitError> {
+    let now = env.ledger().timestamp();
+    let window_id = (now / RATE_LIMIT_WINDOW_SECONDS) * RATE_LIMIT_WINDOW_SECONDS;
+    
+    let key = (caller.clone(), operation, window_id);
+    
+    let mut rate_limits: Map<(Address, Symbol, u64), RateLimitRecord> = env
+        .storage()
+        .instance()
+        .get(&STORAGE_RATE_LIMIT)
+        .unwrap_or_else(|| Map::new(env));
+    
+    let record = rate_limits.get(key.clone()).unwrap_or_else(|| RateLimitRecord {
+        count: 0,
+        window_id,
+    });
+    
+    if record.count >= limit {
+        return Err(RateLimitError::RateLimitExceeded);
+    }
+    
+    let new_record = RateLimitRecord {
+        count: record.count + 1,
+        window_id,
+    };
+    
+    rate_limits.set(key, new_record);
+    env.storage().instance().set(&STORAGE_RATE_LIMIT, &rate_limits);
+    
+    Ok(())
+}
+
+/// Helper to get current rate limit status for an operation
+pub fn get_rate_limit_status(
+    env: &Env,
+    caller: &Address,
+    operation: Symbol,
+) -> (u32, u64) {
+    let now = env.ledger().timestamp();
+    let window_id = (now / RATE_LIMIT_WINDOW_SECONDS) * RATE_LIMIT_WINDOW_SECONDS;
+    
+    let key = (caller.clone(), operation, window_id);
+    
+    let rate_limits: Map<(Address, Symbol, u64), RateLimitRecord> = env
+        .storage()
+        .instance()
+        .get(&STORAGE_RATE_LIMIT)
+        .unwrap_or_else(|| Map::new(env));
+    
+    let record = rate_limits.get(key).unwrap_or_else(|| RateLimitRecord {
+        count: 0,
+        window_id,
+    });
+    
+    (record.count, window_id + RATE_LIMIT_WINDOW_SECONDS)
+}
 
 /// Normalizes caller-supplied pagination limits for all shared paginated reads.
 ///
@@ -222,7 +307,6 @@ pub fn verify_signature(
 
     let sig_bytes = soroban_sdk::Bytes::from_slice(env, signature);
     let pk_bytes = soroban_sdk::Bytes::from_slice(env, public_key);
-    let msg_bytes = soroban_sdk::Bytes::from_slice(env, &prefixed_message);
 
     env.crypto()
         .ed25519_verify(&pk_bytes, &msg_bytes, &sig_bytes)
@@ -393,14 +477,14 @@ impl RemitwiseEvents {
         #[cfg(any(test, feature = "testutils"))]
 >>>>>>> main
         {
-            use soroban_sdk::xdr::ToXdr;
             use soroban_sdk::TryFromVal;
             let val = data.into_val(env);
-            use soroban_sdk::xdr::ToXdr;
-            let xdr_bytes = val.to_xdr(env);
-            let size = xdr_bytes.len();
-            if size > 256 {
-                panic!("Event data size {} exceeds 256-byte budget. Emits must be compact.", size);
+            if let Ok(sc_val) = soroban_sdk::xdr::ScVal::try_from_val(env, &val) {
+                let xdr_bytes = sc_val.to_xdr(env);
+                let size = xdr_bytes.len();
+                if size > 256 {
+                    panic!("Event data size {} exceeds 256-byte budget. Emits must be compact.", size);
+                }
             }
             env.events().publish(topics, val);
         }
