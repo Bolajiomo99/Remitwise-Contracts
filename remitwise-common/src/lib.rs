@@ -4,7 +4,7 @@
 
 extern crate alloc;
 
-use soroban_sdk::{contracterror, contracttype, symbol_short, Symbol};
+use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Env, Map, Symbol};
 
 /// Financial categories for remittance allocation
 #[contracttype]
@@ -161,7 +161,7 @@ pub fn check_and_increment_rate_limit(
         .get(&STORAGE_RATE_LIMIT)
         .unwrap_or_else(|| Map::new(env));
     
-    let record = rate_limits.get(key.clone()).unwrap_or_else(|| RateLimitRecord {
+    let record = rate_limits.get(key.clone()).unwrap_or(RateLimitRecord {
         count: 0,
         window_id,
     });
@@ -198,7 +198,7 @@ pub fn get_rate_limit_status(
         .get(&STORAGE_RATE_LIMIT)
         .unwrap_or_else(|| Map::new(env));
     
-    let record = rate_limits.get(key).unwrap_or_else(|| RateLimitRecord {
+    let record = rate_limits.get(key).unwrap_or(RateLimitRecord {
         count: 0,
         window_id,
     });
@@ -224,6 +224,29 @@ pub fn clamp_limit(limit: u32) -> u32 {
         MAX_PAGE_LIMIT
     } else {
         limit
+    }
+}
+
+/// Error converting an integer to `i128` when the value is out of range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntConversionError {
+    Overflow,
+}
+
+/// Fallible conversion to `i128` for safe cross-type arithmetic.
+pub trait ToI128Checked {
+    fn to_i128_checked(self) -> Result<i128, IntConversionError>;
+}
+
+impl ToI128Checked for u32 {
+    fn to_i128_checked(self) -> Result<i128, IntConversionError> {
+        Ok(self as i128)
+    }
+}
+
+impl ToI128Checked for i32 {
+    fn to_i128_checked(self) -> Result<i128, IntConversionError> {
+        Ok(self as i128)
     }
 }
 
@@ -288,28 +311,32 @@ pub enum SignatureError {
 /// # Returns
 /// * `Ok(())` if the signature is valid
 /// * `Err(SignatureError)` if verification fails
-extern crate alloc;
-
 pub fn verify_signature(
-    _env: &soroban_sdk::Env,
+    env: &soroban_sdk::Env,
     domain_separator: &[u8],
     message: &[u8],
     signature: &[u8],
     public_key: &[u8],
 ) -> Result<(), SignatureError> {
-    let pk_arr: [u8; 32] = public_key.try_into().map_err(|_| SignatureError::InvalidPublicKeyLength)?;
-    let sig_arr: [u8; 64] = signature.try_into().map_err(|_| SignatureError::InvalidSignatureLength)?;
+    let pk_arr: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| SignatureError::InvalidPublicKeyLength)?;
+    let sig_arr: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| SignatureError::InvalidSignatureLength)?;
 
-    let mut prefixed_message = alloc::vec::Vec::with_capacity(domain_separator.len() + message.len());
+    let mut prefixed_message =
+        alloc::vec::Vec::with_capacity(domain_separator.len() + message.len());
     prefixed_message.extend_from_slice(domain_separator);
     prefixed_message.extend_from_slice(message);
 
-    let sig_bytes = soroban_sdk::Bytes::from_slice(env, signature);
-    let pk_bytes = soroban_sdk::Bytes::from_slice(env, public_key);
+    let msg_bytes = soroban_sdk::Bytes::from_slice(env, &prefixed_message);
+    let sig_bytes = soroban_sdk::BytesN::from_array(env, &sig_arr);
+    let pk_bytes = soroban_sdk::BytesN::from_array(env, &pk_arr);
 
     env.crypto()
-        .ed25519_verify(&pk_bytes, &msg_bytes, &sig_bytes)
-        .map_err(|_| SignatureError::VerificationFailed)
+        .ed25519_verify(&pk_bytes, &msg_bytes, &sig_bytes);
+    Ok(())
 }
 
 /// Typed error for slash signature verification.
@@ -612,14 +639,14 @@ impl RemitwiseEvents {
 
 #[cfg(test)]
 mod assert_event_tests {
-    use super::{EventCategory, EventEmitter, EventPriority};
+    use super::{EventCategory, EventPriority, RemitwiseEvents};
 
     #[test]
     fn assert_last_event_matches_emitted_topic_and_data() {
         let env = soroban_sdk::Env::default();
         let action = soroban_sdk::Symbol::new(&env, "test_act");
 
-        EventEmitter::emit(
+        RemitwiseEvents::emit(
             &env,
             EventCategory::Access,
             EventPriority::High,
@@ -627,7 +654,7 @@ mod assert_event_tests {
             (1u32, 2u32),
         );
 
-        EventEmitter::assert_last_event::<(u32, u32), _>(
+        RemitwiseEvents::assert_last_event::<(u32, u32), _>(
             &env,
             EventCategory::Access,
             EventPriority::High,
@@ -640,14 +667,14 @@ mod assert_event_tests {
     #[should_panic(expected = "event action mismatch")]
     fn assert_last_event_panics_on_action_mismatch() {
         let env = soroban_sdk::Env::default();
-        EventEmitter::emit(
+        RemitwiseEvents::emit(
             &env,
             EventCategory::Access,
             EventPriority::High,
             soroban_sdk::Symbol::new(&env, "one"),
             1u32,
         );
-        EventEmitter::assert_last_event::<u32, _>(
+        RemitwiseEvents::assert_last_event::<u32, _>(
             &env,
             EventCategory::Access,
             EventPriority::High,
