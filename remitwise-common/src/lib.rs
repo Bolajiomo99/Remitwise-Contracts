@@ -1,10 +1,7 @@
 #![no_std]
-
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-extern crate alloc;
-
-use soroban_sdk::{contracterror, contracttype, symbol_short, Symbol};
+use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Bytes, Env, Map, Symbol};
 
 /// Financial categories for remittance allocation
 #[contracttype]
@@ -115,6 +112,12 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// Maximum batch size for operations
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// Pre-upgrade snapshot version
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// Storage key for pre-upgrade snapshots
+pub const SNAPSHOT_KEY: Symbol = symbol_short!("SNAPSHOT");
+
 /// Rate limiting constants
 pub const RATE_LIMIT_WINDOW_SECONDS: u64 = 86400; // 24 hours
 const STORAGE_RATE_LIMIT: Symbol = symbol_short!("RATE_LIM");
@@ -134,13 +137,13 @@ pub enum RateLimitError {
 }
 
 /// Helper to check and increment rate limit
-/// 
+///
 /// # Arguments
 /// * `env` - Soroban environment
 /// * `caller` - Address of the caller
 /// * `operation` - Symbol identifying the operation to rate limit
 /// * `limit` - Maximum allowed operations per window
-/// 
+///
 /// # Returns
 /// * `Ok(())` if within limit
 /// * `Err(RateLimitError::RateLimitExceeded)` if limit exceeded
@@ -152,57 +155,55 @@ pub fn check_and_increment_rate_limit(
 ) -> Result<(), RateLimitError> {
     let now = env.ledger().timestamp();
     let window_id = (now / RATE_LIMIT_WINDOW_SECONDS) * RATE_LIMIT_WINDOW_SECONDS;
-    
+
     let key = (caller.clone(), operation, window_id);
-    
+
     let mut rate_limits: Map<(Address, Symbol, u64), RateLimitRecord> = env
         .storage()
         .instance()
         .get(&STORAGE_RATE_LIMIT)
         .unwrap_or_else(|| Map::new(env));
-    
-    let record = rate_limits.get(key.clone()).unwrap_or_else(|| RateLimitRecord {
+
+    let record = rate_limits.get(key.clone()).unwrap_or(RateLimitRecord {
         count: 0,
         window_id,
     });
-    
+
     if record.count >= limit {
         return Err(RateLimitError::RateLimitExceeded);
     }
-    
+
     let new_record = RateLimitRecord {
         count: record.count + 1,
         window_id,
     };
-    
+
     rate_limits.set(key, new_record);
-    env.storage().instance().set(&STORAGE_RATE_LIMIT, &rate_limits);
-    
+    env.storage()
+        .instance()
+        .set(&STORAGE_RATE_LIMIT, &rate_limits);
+
     Ok(())
 }
 
 /// Helper to get current rate limit status for an operation
-pub fn get_rate_limit_status(
-    env: &Env,
-    caller: &Address,
-    operation: Symbol,
-) -> (u32, u64) {
+pub fn get_rate_limit_status(env: &Env, caller: &Address, operation: Symbol) -> (u32, u64) {
     let now = env.ledger().timestamp();
     let window_id = (now / RATE_LIMIT_WINDOW_SECONDS) * RATE_LIMIT_WINDOW_SECONDS;
-    
+
     let key = (caller.clone(), operation, window_id);
-    
+
     let rate_limits: Map<(Address, Symbol, u64), RateLimitRecord> = env
         .storage()
         .instance()
         .get(&STORAGE_RATE_LIMIT)
         .unwrap_or_else(|| Map::new(env));
-    
-    let record = rate_limits.get(key).unwrap_or_else(|| RateLimitRecord {
+
+    let record = rate_limits.get(key).unwrap_or(RateLimitRecord {
         count: 0,
         window_id,
     });
-    
+
     (record.count, window_id + RATE_LIMIT_WINDOW_SECONDS)
 }
 
@@ -224,6 +225,29 @@ pub fn clamp_limit(limit: u32) -> u32 {
         MAX_PAGE_LIMIT
     } else {
         limit
+    }
+}
+
+/// Error converting an integer to `i128` when the value is out of range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntConversionError {
+    Overflow,
+}
+
+/// Fallible conversion to `i128` for safe cross-type arithmetic.
+pub trait ToI128Checked {
+    fn to_i128_checked(self) -> Result<i128, IntConversionError>;
+}
+
+impl ToI128Checked for u32 {
+    fn to_i128_checked(self) -> Result<i128, IntConversionError> {
+        Ok(self as i128)
+    }
+}
+
+impl ToI128Checked for i32 {
+    fn to_i128_checked(self) -> Result<i128, IntConversionError> {
+        Ok(self as i128)
     }
 }
 
@@ -288,28 +312,29 @@ pub enum SignatureError {
 /// # Returns
 /// * `Ok(())` if the signature is valid
 /// * `Err(SignatureError)` if verification fails
-extern crate alloc;
-
 pub fn verify_signature(
-    _env: &soroban_sdk::Env,
+    env: &soroban_sdk::Env,
     domain_separator: &[u8],
     message: &[u8],
     signature: &[u8],
     public_key: &[u8],
 ) -> Result<(), SignatureError> {
-    let pk_arr: [u8; 32] = public_key.try_into().map_err(|_| SignatureError::InvalidPublicKeyLength)?;
-    let sig_arr: [u8; 64] = signature.try_into().map_err(|_| SignatureError::InvalidSignatureLength)?;
+    let pk_arr: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| SignatureError::InvalidPublicKeyLength)?;
+    let sig_arr: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| SignatureError::InvalidSignatureLength)?;
 
-    let mut prefixed_message = alloc::vec::Vec::with_capacity(domain_separator.len() + message.len());
-    prefixed_message.extend_from_slice(domain_separator);
-    prefixed_message.extend_from_slice(message);
+    let mut msg_bytes = Bytes::from_slice(env, domain_separator);
+    msg_bytes.extend_from_slice(message);
 
-    let sig_bytes = soroban_sdk::Bytes::from_slice(env, signature);
-    let pk_bytes = soroban_sdk::Bytes::from_slice(env, public_key);
+    let sig_bytes = soroban_sdk::BytesN::from_array(env, &sig_arr);
+    let pk_bytes = soroban_sdk::BytesN::from_array(env, &pk_arr);
 
     env.crypto()
-        .ed25519_verify(&pk_bytes, &msg_bytes, &sig_bytes)
-        .map_err(|_| SignatureError::VerificationFailed)
+        .ed25519_verify(&pk_bytes, &msg_bytes, &sig_bytes);
+    Ok(())
 }
 
 /// Typed error for slash signature verification.
@@ -323,7 +348,7 @@ pub enum SlashError {
 /// Verify an optional second-party slash signature.
 ///
 /// This provides a defence-in-depth gate before executing destructive slash operations.
-/// 
+///
 /// # Arguments
 /// * `env` - Soroban environment
 /// * `message` - The payload being authorized (e.g. amount or slash payload)
@@ -512,7 +537,10 @@ impl RemitwiseEvents {
                 let xdr_bytes = sc_val.to_xdr(env);
                 let size = xdr_bytes.len();
                 if size > 256 {
-                    panic!("Event data size {} exceeds 256-byte budget. Emits must be compact.", size);
+                    panic!(
+                        "Event data size {} exceeds 256-byte budget. Emits must be compact.",
+                        size
+                    );
                 }
             }
             env.events().publish(topics, val);
@@ -565,9 +593,7 @@ impl RemitwiseEvents {
         use soroban_sdk::TryFromVal;
 
         let all = env.events().all();
-        let (_cid, topics, data) = all
-            .last()
-            .expect("expected at least one emitted event");
+        let (_cid, topics, data) = all.last().expect("expected at least one emitted event");
 
         // Topic schema emitted by `EventEmitter::emit`:
         // (symbol_short!("Remitwise"), category_u32, priority_u32, action)
@@ -612,14 +638,14 @@ impl RemitwiseEvents {
 
 #[cfg(test)]
 mod assert_event_tests {
-    use super::{EventCategory, EventEmitter, EventPriority};
+    use super::{EventCategory, EventPriority, RemitwiseEvents};
 
     #[test]
     fn assert_last_event_matches_emitted_topic_and_data() {
         let env = soroban_sdk::Env::default();
         let action = soroban_sdk::Symbol::new(&env, "test_act");
 
-        EventEmitter::emit(
+        RemitwiseEvents::emit(
             &env,
             EventCategory::Access,
             EventPriority::High,
@@ -627,7 +653,7 @@ mod assert_event_tests {
             (1u32, 2u32),
         );
 
-        EventEmitter::assert_last_event::<(u32, u32), _>(
+        RemitwiseEvents::assert_last_event::<(u32, u32), _>(
             &env,
             EventCategory::Access,
             EventPriority::High,
@@ -640,14 +666,14 @@ mod assert_event_tests {
     #[should_panic(expected = "event action mismatch")]
     fn assert_last_event_panics_on_action_mismatch() {
         let env = soroban_sdk::Env::default();
-        EventEmitter::emit(
+        RemitwiseEvents::emit(
             &env,
             EventCategory::Access,
             EventPriority::High,
             soroban_sdk::Symbol::new(&env, "one"),
             1u32,
         );
-        EventEmitter::assert_last_event::<u32, _>(
+        RemitwiseEvents::assert_last_event::<u32, _>(
             &env,
             EventCategory::Access,
             EventPriority::High,

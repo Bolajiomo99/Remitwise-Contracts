@@ -7,7 +7,7 @@ use soroban_sdk::{
 mod utils;
 use utils::{u64_to_u32, ConversionError};
 
-pub use remitwise_common::{Category, CoverageType, DEFAULT_PAGE_LIMIT, ToI128Checked};
+pub use remitwise_common::{Category, CoverageType, DEFAULT_PAGE_LIMIT};
 
 // Storage TTL constants
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -147,7 +147,10 @@ pub struct InsuranceReport {
     pub data_availability: DataAvailability,
 }
 
-/// Family spending report
+/// Family spending report aggregated from the configured `family_wallet` dependency.
+///
+/// See `reporting/docs/FAMILY_SPENDING_REPORT.md` for the full schema and
+/// `DataAvailability` degradation rules.
 #[contracttype]
 #[derive(Clone)]
 pub struct FamilySpendingReport {
@@ -496,7 +499,7 @@ fn trend_from_amounts(current_amount: i128, previous_amount: i128) -> TrendData 
         },
     );
     let change_percentage = if previous_amount > 0 {
-        safe_percent(change_amount, previous_amount, 100).clamp(i32::MIN.to_i128_checked().unwrap(), i32::MAX.to_i128_checked().unwrap())
+        safe_percent(change_amount, previous_amount, 100).clamp(i32::MIN as i128, i32::MAX as i128)
             as i32
     } else if current_amount > 0 {
         100
@@ -1006,8 +1009,8 @@ impl ReportingContract {
                     return Err(ReportingError::InvalidPercentageSplit);
                 }
 
-                // Formula used is (amount * percentage) / 100
-                let amount = total_amount.checked_mul(p.to_i128_checked().unwrap()).unwrap_or(0) / 100;
+                // Percentages are basis points; divide by 10_000 (100.00%).
+                let amount = total_amount.checked_mul(p as i128).unwrap_or(0) / 10_000;
                 split_amounts.push_back(amount);
             }
 
@@ -1254,12 +1257,31 @@ impl ReportingContract {
 
     /// Generate a family-wallet spending report.
     ///
-    /// Reads the configured `family_wallet` dependency to enumerate members and
-    /// fetch each member's current `SpendingTracker`, returning a per-member
-    /// breakdown plus aggregate totals. When the family wallet is unreachable
-    /// the report degrades to `DataAvailability::Missing`; when only part of
-    /// the dependency data can be read the report degrades to
-    /// `DataAvailability::Partial`.
+    /// Reads the configured `family_wallet` dependency via [`FamilyWalletClient`]
+    /// to enumerate members (`get_member_addresses_page`) and fetch each member's
+    /// current [`SpendingTracker`] (`get_spending_tracker`), returning a per-member
+    /// breakdown plus aggregate totals.
+    ///
+    /// # Aggregation
+    ///
+    /// - Members are paged with [`DEP_PAGE_LIMIT`] and deduplicated by address.
+    /// - `total_spending` sums `SpendingTracker.current_spent` using checked
+    ///   arithmetic; overflow saturates and marks the report `Partial`.
+    /// - `average_per_member` is `total_spending / total_members`, or `0` when
+    ///   there are no members (divide-by-zero safe).
+    ///
+    /// # DataAvailability degradation
+    ///
+    /// | Value | Condition |
+    /// |---|---|
+    /// | `Complete` | All member pages drained and every spending read succeeded (or returned `None`). |
+    /// | `Partial` | Member paging hit [`MAX_DEP_PAGES`], a mid-pagination call failed after at least one page, a spending tracker read failed, or total spending overflowed. |
+    /// | `Missing` | The first member page is empty, or the family wallet is unreachable on the first fetch. |
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidPeriod` when `period_start > period_end`.
+    /// - `AddressesNotConfigured` when dependency addresses have not been set.
     pub fn get_family_spending_report(
         env: Env,
         _caller: Address,

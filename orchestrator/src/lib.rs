@@ -651,8 +651,7 @@ impl Orchestrator {
 
     /// Return the pending reward balance for an address without claiming it.
     pub fn get_pending_rewards(env: Env, address: Address) -> i128 {
-        let rewards: Option<Map<Address, i128>> =
-            env.storage().instance().get(&PENDING_REWARDS);
+        let rewards: Option<Map<Address, i128>> = env.storage().instance().get(&PENDING_REWARDS);
         match rewards {
             Some(m) => m.get(address).unwrap_or(0),
             None => 0,
@@ -1659,6 +1658,10 @@ mod tests_nonce_eviction {
         assert_eq!(client.get_nonce(&executor), 1);
     }
 }
+
+#[cfg(test)]
+#[macro_use]
+extern crate std;
 
 #[cfg(test)]
 #[path = "test.rs"]

@@ -2,9 +2,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use remitwise_common::{
-    clamp_limit, EventCategory, EventPriority, RemitwiseEvents, ARCHIVE_BUMP_AMOUNT,
-    ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, INSTANCE_BUMP_AMOUNT,
-    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, check_and_increment_rate_limit, RateLimitError,
+    check_and_increment_rate_limit, clamp_limit, EventCategory, EventPriority, RemitwiseEvents,
+    ARCHIVE_BUMP_AMOUNT, ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, INSTANCE_BUMP_AMOUNT,
+    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 
 use soroban_sdk::{
@@ -165,6 +165,16 @@ pub enum BillPaymentsError {
     InvalidTagContent = 19,
     /// Rate limit exceeded for this operation
     RateLimitExceeded = 20,
+    /// Schedule interval is below the minimum allowed duration
+    ScheduleIntervalTooShort = 21,
+    /// Schedule lead time exceeds the maximum allowed duration
+    ScheduleLeadTimeTooLong = 22,
+    /// Owner has reached the maximum number of bill schedules
+    ScheduleCapExceeded = 23,
+    /// Bill schedule with the given ID does not exist
+    ScheduleNotFound = 24,
+    /// Bill schedule is not active
+    ScheduleNotActive = 25,
 }
 
 pub type Error = BillPaymentsError;
@@ -279,7 +289,11 @@ impl BillPayments {
             .unwrap_or_else(|| Map::new(env));
         let mut ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
         let len = ids.len();
-        if len == 0 || ids.get(len - 1).unwrap() < bill_id {
+        let append_at_end = match ids.get(len.saturating_sub(1)) {
+            None => true,
+            Some(last) => last < bill_id,
+        };
+        if append_at_end {
             ids.push_back(bill_id);
             idx.set(owner.clone(), ids);
             env.storage().instance().set(&STORAGE_OWNER_INDEX, &idx);
@@ -455,7 +469,11 @@ impl BillPayments {
         let key = (owner.clone(), currency.clone());
         let mut ids = idx.get(key.clone()).unwrap_or_else(|| Vec::new(env));
         let len = ids.len();
-        if len == 0 || ids.get(len - 1).unwrap() < bill_id {
+        let append_at_end = match ids.get(len.saturating_sub(1)) {
+            None => true,
+            Some(last) => last < bill_id,
+        };
+        if append_at_end {
             ids.push_back(bill_id);
             idx.set(key, ids);
             Self::save_currency_index(env, &idx);
@@ -935,7 +953,29 @@ impl BillPayments {
     /// @dev Equivalent to calling `pause` plus pausing all supported functions.
     /// @return Ok(()) on success, otherwise the underlying pause errors.
     pub fn emergency_pause_all(env: Env, caller: Address) -> Result<(), Error> {
-        Self::pause(env.clone(), caller.clone())?;
+        caller.require_auth();
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
+        if admin != caller {
+            return Err(BillPaymentsError::UnauthorizedPause);
+        }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PAUSED"), &true);
+        env.storage().instance().remove(&symbol_short!("UNP_AT"));
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::System,
+            EventPriority::High,
+            symbol_short!("paused"),
+            (),
+        );
+
+        let mut paused_functions: Map<Symbol, bool> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PAUSED_FN"))
+            .unwrap_or_else(|| Map::new(&env));
         for func in [
             pause_functions::CREATE_BILL,
             pause_functions::PAY_BILL,
@@ -946,9 +986,15 @@ impl BillPayments {
             pause_functions::MODIFY_BILL_SCHEDULE,
             pause_functions::CANCEL_BILL_SCHEDULE,
             pause_functions::EXECUTE_BILL_SCHEDULES,
+            pause_functions::ADD_TAGS,
+            pause_functions::REM_TAGS,
+            pause_functions::SET_EXT_REF,
         ] {
-            let _ = Self::pause_function(env.clone(), caller.clone(), func);
+            paused_functions.set(func, true);
         }
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PAUSED_FN"), &paused_functions);
         Ok(())
     }
 
@@ -1588,14 +1634,15 @@ impl BillPayments {
     ) -> Result<u32, BillPaymentsError> {
         owner.require_auth();
         Self::require_not_paused(&env, pause_functions::CREATE_BILL)?;
-        
+
         // Check rate limit
         check_and_increment_rate_limit(
             &env,
             &owner,
             pause_functions::CREATE_BILL,
             CREATE_BILL_RATE_LIMIT,
-        ).map_err(|_| BillPaymentsError::RateLimitExceeded)?;
+        )
+        .map_err(|_| BillPaymentsError::RateLimitExceeded)?;
 
         let current_time = env.ledger().timestamp();
         if due_date == 0 || due_date < current_time {
@@ -1715,14 +1762,15 @@ impl BillPayments {
     pub fn pay_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::PAY_BILL)?;
-        
+
         // Check rate limit
         check_and_increment_rate_limit(
             &env,
             &caller,
             pause_functions::PAY_BILL,
             PAY_BILL_RATE_LIMIT,
-        ).map_err(|_| BillPaymentsError::RateLimitExceeded)?;
+        )
+        .map_err(|_| BillPaymentsError::RateLimitExceeded)?;
 
         Self::extend_instance_ttl(&env);
         let mut bills: Map<u32, Bill> = env
@@ -1796,11 +1844,7 @@ impl BillPayments {
             // Update currency index for the newly created recurring bill
             Self::index_add_currency(&env, &caller, &bill.currency, next_id);
             // Update unpaid total for the new recurring bill
-<<<<<<< add-assert-test
             Self::adjust_unpaid_total(&env, &caller, next_bill_amount);
-=======
-            Self::adjust_unpaid_total(&env, &caller, next_bill.amount);
->>>>>>> main
             env.events().publish(
                 (symbol_short!("bill"), BillEvent::RecurringBillCreated),
                 (next_id, bill_id, next_due_date),
@@ -1856,7 +1900,8 @@ impl BillPayments {
     /// - Emits `(bill, tags_add)` with `(bill_id, caller, tags)`.
     pub fn add_tags_to_bill(env: Env, caller: Address, bill_id: u32, tags: Vec<String>) {
         caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::ADD_TAGS).unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));
+        Self::require_not_paused(&env, pause_functions::ADD_TAGS)
+            .unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));
         let normalized_tags = Self::validate_and_normalize_tags(&env, &tags);
         Self::extend_instance_ttl(&env);
 
@@ -1907,7 +1952,8 @@ impl BillPayments {
     /// - Emits `(bill, tags_rem)` with `(bill_id, caller, tags)`.
     pub fn remove_tags_from_bill(env: Env, caller: Address, bill_id: u32, tags: Vec<String>) {
         caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::REM_TAGS).unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));
+        Self::require_not_paused(&env, pause_functions::REM_TAGS)
+            .unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));
         let normalized_tags = Self::validate_and_normalize_tags(&env, &tags);
         Self::extend_instance_ttl(&env);
 
@@ -2564,14 +2610,15 @@ impl BillPayments {
     pub fn cancel_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::CANCEL_BILL)?;
-        
+
         // Check rate limit
         check_and_increment_rate_limit(
             &env,
             &caller,
             pause_functions::CANCEL_BILL,
             CANCEL_BILL_RATE_LIMIT,
-        ).map_err(|_| BillPaymentsError::RateLimitExceeded)?;
+        )
+        .map_err(|_| BillPaymentsError::RateLimitExceeded)?;
         let mut bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -2742,7 +2789,7 @@ impl BillPayments {
     /// - Action symbol: `"restored"` via [`RemitwiseEvents::emit`]
     pub fn restore_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         caller.require_auth();
-        let _ = Self::require_not_paused(&env, pause_functions::RESTORE);
+        Self::require_not_paused(&env, pause_functions::RESTORE)?;
         Self::extend_instance_ttl(&env);
 
         let mut archived: Map<u32, ArchivedBill> = env

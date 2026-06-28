@@ -19,7 +19,10 @@
 //! - pagination: page-by-page traversal preserves the same ascending-ID order.
 
 use remittance_split::{RemittanceSplit, RemittanceSplitClient};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, Env,
+};
 
 /// Register the contract and initialise a split for a freshly generated owner.
 ///
@@ -34,8 +37,8 @@ fn setup(env: &Env) -> (RemittanceSplitClient<'_>, Address) {
 
     let owner = Address::generate(env);
     let token = Address::generate(env);
-    // percentages: 50 / 30 / 15 / 5
-    client.initialize_split(&owner, &0, &token, &50, &30, &15, &5);
+    // percentages in basis points: 50% / 30% / 15% / 5%
+    client.initialize_split(&owner, &0, &token, &5000, &3000, &1500, &500);
 
     (client, owner)
 }
@@ -120,12 +123,7 @@ fn paginated_schedules_preserve_ascending_id_order_across_pages() {
 
     // Create six schedules so we get multiple non-trivial pages of two.
     for i in 1..=6u64 {
-        client.create_remittance_schedule(
-            &owner,
-            &(100 * i as i128),
-            &(2_000 + i * 1_000),
-            &0,
-        );
+        client.create_remittance_schedule(&owner, &(100 * i as i128), &(2_000 + i * 1_000), &0);
     }
 
     // Walk every page using the returned cursor and flatten the IDs. The

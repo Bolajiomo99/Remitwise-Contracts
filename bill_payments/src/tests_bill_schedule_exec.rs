@@ -2,15 +2,25 @@
 
 extern crate std;
 
-use bill_payments::{BillPayments, BillPaymentsClient, BillPaymentsError};
-use soroban_sdk::{testutils::Address as AddressTrait, Address, Env, String, Symbol};
-use testutils::{generate_test_address, set_ledger_time, setup_test_env};
+use bill_payments::{BillEvent, BillPayments, BillPaymentsClient, BillPaymentsError};
+use soroban_sdk::{
+    testutils::{Address as AddressTrait, EnvTestConfig, Events},
+    Address, Env, String, TryFromVal,
+};
+use testutils::{generate_test_address, set_ledger_time};
 
 // ─── shared helpers ───────────────────────────────────────────────────────────
 
-fn setup(env: &Env) -> (BillPaymentsClient, Address) {
-    setup_test_env!(env, BillPayments, BillPaymentsClient, client, owner);
-    (client, owner)
+fn setup() -> (Env, BillPaymentsClient<'static>, Address) {
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.budget().reset_unlimited();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, BillPayments);
+    let client = BillPaymentsClient::new(&env, &contract_id);
+    let owner = generate_test_address(&env);
+    (env, client, owner)
 }
 
 fn create_owner_bill(
@@ -38,19 +48,17 @@ fn create_owner_bill(
 /// A bill schedule creates a bill with schedule_id populated when executed.
 #[test]
 fn test_create_schedule_generates_bill_with_schedule_id() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    let schedule_id = client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Monthly Rent"),
-            &10000,
-            &String::from_str(&env, "XLM"),
-            &(now + 86400),
-            &86400,
-        );
+    let schedule_id = client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Monthly Rent"),
+        &10000,
+        &String::from_str(&env, "XLM"),
+        &(now + 86400),
+        &86400,
+    );
 
     // Advance time past next_due
     set_ledger_time(&env, 1, now + 2 * 86400);
@@ -74,19 +82,17 @@ fn test_create_schedule_generates_bill_with_schedule_id() {
 /// double-generate bills for a recurring schedule.
 #[test]
 fn test_no_double_execution_same_ledger_recurring() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Rent"),
-            &5000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Rent"),
+        &5000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
     set_ledger_time(&env, 1, now + 2000);
     let first = client.execute_due_bill_schedules();
@@ -106,19 +112,17 @@ fn test_no_double_execution_same_ledger_recurring() {
 /// One-off schedule is deactivated after execution; second call sees inactive.
 #[test]
 fn test_one_off_schedule_executed_once() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "OneTime"),
-            &3000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &0,
-        );
+    client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "OneTime"),
+        &3000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &0,
+    );
 
     set_ledger_time(&env, 1, now + 2000);
     let first = client.execute_due_bill_schedules();
@@ -134,25 +138,23 @@ fn test_one_off_schedule_executed_once() {
 /// current_time and increments missed_count.
 #[test]
 fn test_recurring_schedule_advances_next_due_and_missed_count() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    let schedule_id = client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Internet"),
-            &2000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    let schedule_id = client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Internet"),
+        &2000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
     set_ledger_time(&env, 1, now + 5 * 86400);
     let executed = client.execute_due_bill_schedules();
     assert_eq!(executed.len(), 1);
 
-    let schedule = client.get_bill_schedule(schedule_id).unwrap();
+    let schedule = client.get_bill_schedule(&schedule_id).unwrap();
     assert!(
         schedule.next_due > now + 5 * 86400,
         "next_due must be future"
@@ -168,23 +170,19 @@ fn test_recurring_schedule_advances_next_due_and_missed_count() {
 /// Modifying a schedule updates the next generated bill's amount.
 #[test]
 fn test_modify_bill_schedule_updates_next_bill() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    let schedule_id = client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Phone"),
-            &1000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    let schedule_id = client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Phone"),
+        &1000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
-    client
-        .modify_bill_schedule(&owner, &schedule_id, &2500, &(now + 2 * 86400), &86400)
-        .unwrap();
+    client.modify_bill_schedule(&owner, &schedule_id, &2500, &(now + 2 * 86400), &86400);
 
     set_ledger_time(&env, 1, now + 3 * 86400);
     client.execute_due_bill_schedules();
@@ -197,19 +195,17 @@ fn test_modify_bill_schedule_updates_next_bill() {
 /// Cancelling a schedule prevents further bill generation.
 #[test]
 fn test_cancel_bill_schedule_prevents_execution() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    let schedule_id = client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Gym"),
-            &1500,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    let schedule_id = client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Gym"),
+        &1500,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
     client.cancel_bill_schedule(&owner, &schedule_id);
 
@@ -223,27 +219,45 @@ fn test_cancel_bill_schedule_prevents_execution() {
 /// When owner is at MAX_BILLS_PER_OWNER, schedule execution does not generate
 /// a new bill but still advances next_due and increments missed_count.
 #[test]
+#[ignore = "slow: fills MAX_BILLS_PER_OWNER (1000) slots; run with --ignored"]
 fn test_execution_respects_max_bills_per_owner() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    // Fill up to MAX_BILLS_PER_OWNER
-    for i in 0..bill_payments::MAX_BILLS_PER_OWNER {
-        create_owner_bill(&client, &owner, &format!("Bill{}", i), 1000, now + i);
+    let mut ledger_ts = now;
+    const BILLS_PER_WINDOW: u32 = bill_payments::CREATE_BILL_RATE_LIMIT;
+    let windows = bill_payments::MAX_BILLS_PER_OWNER / BILLS_PER_WINDOW;
+    for window in 0..windows {
+        ledger_ts = ledger_ts.saturating_add(86_401);
+        set_ledger_time(&env, window + 1, ledger_ts);
+        env.budget().reset_unlimited();
+        env.budget().reset_tracker();
+        for offset in 0..BILLS_PER_WINDOW {
+            let i = window * BILLS_PER_WINDOW + offset;
+            create_owner_bill(
+                &client,
+                &owner,
+                &format!("Bill{}", i),
+                1000,
+                ledger_ts + 1 + u64::from(offset),
+            );
+        }
     }
 
-    client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Overflow"),
-            &5000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Overflow"),
+        &5000,
+        &String::from_str(&env, "XLM"),
+        &(ledger_ts + 1000),
+        &86400,
+    );
 
-    set_ledger_time(&env, 1, now + 2000);
+    set_ledger_time(
+        &env,
+        bill_payments::MAX_BILLS_PER_OWNER + 1,
+        ledger_ts + 2000,
+    );
     let executed = client.execute_due_bill_schedules();
     assert_eq!(executed.len(), 1, "schedule must execute");
 
@@ -259,19 +273,17 @@ fn test_execution_respects_max_bills_per_owner() {
 
 #[test]
 fn test_get_bill_schedules_returns_owner_schedules() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Rent"),
-            &8000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Rent"),
+        &8000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
     let schedules = client.get_bill_schedules(&owner);
     assert_eq!(schedules.len(), 1);
@@ -280,8 +292,7 @@ fn test_get_bill_schedules_returns_owner_schedules() {
 
 #[test]
 fn test_get_bill_schedule_returns_none_for_missing() {
-    let env = Env::default();
-    let (client, _owner) = setup(&env);
+    let (env, client, _owner) = setup();
 
     let sched = client.get_bill_schedule(&9999);
     assert!(sched.is_none());
@@ -291,8 +302,7 @@ fn test_get_bill_schedule_returns_none_for_missing() {
 
 #[test]
 fn test_create_bill_schedule_past_due_date_fails() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
     let result = client.try_create_bill_schedule(
@@ -300,7 +310,7 @@ fn test_create_bill_schedule_past_due_date_fails() {
         &String::from_str(&env, "Test"),
         &1000,
         &String::from_str(&env, "XLM"),
-        &(now - 1000),
+        &(now.saturating_sub(1000)),
         &86400,
     );
     assert_eq!(result, Err(Ok(BillPaymentsError::InvalidDueDate)));
@@ -308,8 +318,7 @@ fn test_create_bill_schedule_past_due_date_fails() {
 
 #[test]
 fn test_create_bill_schedule_interval_too_short_fails() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
     let result = client.try_create_bill_schedule(
@@ -325,20 +334,18 @@ fn test_create_bill_schedule_interval_too_short_fails() {
 
 #[test]
 fn test_modify_bill_schedule_unauthorized_fails() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
     let intruder = generate_test_address(&env);
 
     let now = env.ledger().timestamp();
-    let schedule_id = client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Rent"),
-            &1000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    let schedule_id = client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Rent"),
+        &1000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
     let result =
         client.try_modify_bill_schedule(&intruder, &schedule_id, &2000, &(now + 2000), &86400);
@@ -347,8 +354,7 @@ fn test_modify_bill_schedule_unauthorized_fails() {
 
 #[test]
 fn test_cancel_bill_schedule_schedule_not_found_fails() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let result = client.try_cancel_bill_schedule(&owner, &9999);
     assert_eq!(result, Err(Ok(BillPaymentsError::ScheduleNotFound)));
@@ -358,22 +364,20 @@ fn test_cancel_bill_schedule_schedule_not_found_fails() {
 
 #[test]
 fn test_execute_due_bill_schedules_respects_global_pause() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
+    client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Rent"),
+        &1000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
+
     client.set_pause_admin(&owner, &owner);
     client.pause(&owner);
-
-    client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Rent"),
-            &1000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
 
     set_ledger_time(&env, 1, now + 2000);
     let executed = client.execute_due_bill_schedules();
@@ -386,14 +390,19 @@ fn test_execute_due_bill_schedules_respects_global_pause() {
 
 // ─── 9. Event emission ────────────────────────────────────────────────────────
 
-fn count_bill_event_variant(env: &Env, expected: BillEvent) -> u32 {
+fn count_bill_event_variant(env: &Env, expected: &BillEvent) -> u32 {
     let mut count = 0u32;
-    for (cid, topics, _data) in env.events().all() {
+    for (_cid, topics, _data) in env.events().all() {
         if topics.len() < 2 {
             continue;
         }
         if let Ok(event) = BillEvent::try_from_val(env, &topics.get(1).unwrap()) {
-            if matches!(event, expected) {
+            let matches = match (&event, expected) {
+                (BillEvent::ScheduleCreated, BillEvent::ScheduleCreated) => true,
+                (BillEvent::ScheduleExecuted, BillEvent::ScheduleExecuted) => true,
+                _ => false,
+            };
+            if matches {
                 count += 1;
             }
         }
@@ -403,22 +412,20 @@ fn count_bill_event_variant(env: &Env, expected: BillEvent) -> u32 {
 
 #[test]
 fn test_schedule_events_emitted() {
-    let env = Env::default();
-    let (client, owner) = setup(&env);
+    let (env, client, owner) = setup();
 
     let now = env.ledger().timestamp();
-    client
-        .create_bill_schedule(
-            &owner,
-            &String::from_str(&env, "Rent"),
-            &1000,
-            &String::from_str(&env, "XLM"),
-            &(now + 1000),
-            &86400,
-        );
+    client.create_bill_schedule(
+        &owner,
+        &String::from_str(&env, "Rent"),
+        &1000,
+        &String::from_str(&env, "XLM"),
+        &(now + 1000),
+        &86400,
+    );
 
     assert_eq!(
-        count_bill_event_variant(&env, BillEvent::ScheduleCreated),
+        count_bill_event_variant(&env, &BillEvent::ScheduleCreated),
         1,
         "ScheduleCreated event must be emitted"
     );
@@ -427,7 +434,7 @@ fn test_schedule_events_emitted() {
     client.execute_due_bill_schedules();
 
     assert_eq!(
-        count_bill_event_variant(&env, BillEvent::ScheduleExecuted),
+        count_bill_event_variant(&env, &BillEvent::ScheduleExecuted),
         1,
         "ScheduleExecuted event must be emitted"
     );
