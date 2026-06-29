@@ -17,7 +17,7 @@ extern crate std;
 
 use super::*;
 use proptest::prelude::*;
-use soroban_sdk::{Env, String, Vec};
+use soroban_sdk::{Bytes, Env, String, Vec};
 
 // helper: build a single-element tag Vec
 fn single(env: &Env, tag: &str) -> Vec<String> {
@@ -570,4 +570,50 @@ fn test_verify_slash_signature_invalid() {
     // Verify the invalid slash signature
     let result = verify_slash_signature(&env, message, Some(&invalid_signature), &pk);
     assert_eq!(result, Err(SlashError::InvalidSignature));
+}
+
+// ─── guard_bytes_len: XDR return-size budget ─────────────────────────────────
+
+/// Empty `Bytes` is well within the budget.
+#[test]
+fn test_guard_bytes_len_accepts_empty() {
+    let env = Env::default();
+    assert_eq!(guard_bytes_len(&Bytes::new(&env)), Ok(()));
+}
+
+/// A value exactly at `MAX_BYTES_RETURN` bytes must be accepted (inclusive upper bound).
+#[test]
+fn test_guard_bytes_len_accepts_value_at_limit() {
+    let env = Env::default();
+    let data = [0u8; 8192];
+    let b = Bytes::from_slice(&env, &data);
+    assert_eq!(guard_bytes_len(&b), Ok(()));
+}
+
+/// A value one byte over `MAX_BYTES_RETURN` must be rejected.
+///
+/// This is the negative test for the XDR length guard.  Before the guard was
+/// introduced there was no check; a consumer receiving an oversized `Bytes`
+/// value had to allocate a buffer of arbitrary size — a DoS vector.  After the
+/// fix, `guard_bytes_len` returns `BytesReturnError::ReturnTooLarge` so the
+/// contract can surface a typed error instead of silently returning oversized data.
+#[test]
+fn test_guard_bytes_len_rejects_oversized_value() {
+    let env = Env::default();
+    let data = [0u8; 8193]; // MAX_BYTES_RETURN + 1
+    let b = Bytes::from_slice(&env, &data);
+    assert_eq!(
+        guard_bytes_len(&b),
+        Err(BytesReturnError::ReturnTooLarge),
+        "values larger than MAX_BYTES_RETURN must be rejected to prevent consumer DoS"
+    );
+}
+
+/// A value far above the limit must also be rejected (not just the boundary).
+#[test]
+fn test_guard_bytes_len_rejects_large_value() {
+    let env = Env::default();
+    let data = [0u8; 65536];
+    let b = Bytes::from_slice(&env, &data);
+    assert_eq!(guard_bytes_len(&b), Err(BytesReturnError::ReturnTooLarge));
 }
